@@ -1,0 +1,14 @@
+.lottie-thorvg {
+  display: flex;
+  justify-content: center;
+}
+
+.lottie-thorvg canvas {
+  max-width: 100%;
+  height: auto;
+}
+
+.lottie-thorvg-error {
+  color: var(--text-error);
+  font-size: var(--font-ui-small);
+}

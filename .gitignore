@@ -1,0 +1,5 @@
+node_modules/
+main.js
+
+# Local scratch vault used to try the plugin; created by `npm run build`.
+test-vault/

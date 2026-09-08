@@ -1,0 +1,23 @@
+{
+  "name": "obsidian-lottie",
+  "version": "0.1.0",
+  "description": "Obsidian plugin that renders Lottie animations in notes with ThorVG",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node esbuild.config.mjs production && node scripts/install.mjs",
+    "dev": "node esbuild.config.mjs && node scripts/install.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@thorvg/webcanvas": "^1.1.1"
+  }
+}
