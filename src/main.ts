@@ -656,9 +656,6 @@ class LottieView extends FileView implements LottieSurface {
 export default class LottiePlugin extends Plugin {
   settings: LottieSettings = { ...DEFAULT_SETTINGS };
 
-  /** Backend the running engine was created with, for the settings screen. */
-  activeRenderer: RendererType | null = null;
-
   /** Every embed and view currently holding ThorVG objects. */
   readonly surfaces = new Set<LottieSurface>();
 
@@ -715,10 +712,9 @@ export default class LottiePlugin extends Plugin {
 
   engine(): Promise<ThorVGNamespace> {
     if (!this.enginePromise) {
-      const renderer = this.settings.renderer;
-      this.enginePromise = ThorVG.init({ renderer, locateFile: () => wasmBlobUrl() }).then((tvg) => {
-        this.activeRenderer = renderer;
-        return tvg;
+      this.enginePromise = ThorVG.init({
+        renderer: this.settings.renderer,
+        locateFile: () => wasmBlobUrl(),
       });
     }
     return this.enginePromise;
@@ -742,7 +738,6 @@ export default class LottiePlugin extends Plugin {
     for (const surface of this.surfaces) surface.release();
     const engine = this.enginePromise;
     this.enginePromise = null;
-    this.activeRenderer = null;
     if (!engine) return;
     try {
       (await engine).term();
@@ -789,19 +784,9 @@ class LottieSettingTab extends PluginSettingTab {
         for (const [value, label] of Object.entries(RENDERER_LABELS)) {
           dropdown.addOption(value, label);
         }
-        dropdown.setValue(this.plugin.settings.renderer).onChange(async (value) => {
-          await this.plugin.setRenderer(value as RendererType);
-          this.display();
-        });
+        dropdown
+          .setValue(this.plugin.settings.renderer)
+          .onChange((value) => void this.plugin.setRenderer(value as RendererType));
       });
-
-    const active = this.plugin.activeRenderer;
-    new Setting(this.containerEl)
-      .setName("Active engine")
-      .setDesc(
-        active
-          ? `Animations are currently drawn with ${RENDERER_LABELS[active]}.`
-          : "No animation has been rendered yet; the engine starts with the first one.",
-      );
   }
 }
