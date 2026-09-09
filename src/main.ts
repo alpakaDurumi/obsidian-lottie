@@ -8,6 +8,7 @@ import {
   Setting,
   TAbstractFile,
   TFile,
+  debounce,
   setIcon,
 } from "obsidian";
 import ThorVG, {
@@ -150,14 +151,27 @@ function isLottieJson(text: string): boolean {
 class LottieIndex extends Component {
   private known = new Map<string, boolean>();
 
-  constructor(private app: App) {
+  /**
+   * @param onModified Called after a `.json` has been re-classified, so an
+   *   embed already showing that file can pick the new contents up.
+   */
+  constructor(
+    private app: App,
+    private onModified: (file: TFile) => void,
+  ) {
     super();
   }
 
   onload(): void {
     const { vault } = this.app;
     this.registerEvent(vault.on("create", (file) => void this.classify(file)));
-    this.registerEvent(vault.on("modify", (file) => void this.classify(file)));
+    this.registerEvent(
+      vault.on("modify", (file) => {
+        void this.classify(file).then(() => {
+          if (file instanceof TFile && file.extension === EXTENSION) this.onModified(file);
+        });
+      }),
+    );
     this.registerEvent(vault.on("delete", (file) => this.known.delete(file.path)));
     this.registerEvent(
       vault.on("rename", (file, oldPath) => {
@@ -206,7 +220,7 @@ class LottieEmbed extends MarkdownRenderChild {
   constructor(
     containerEl: HTMLElement,
     private plugin: LottiePlugin,
-    private file: TFile,
+    readonly file: TFile,
   ) {
     super(containerEl);
   }
@@ -218,18 +232,14 @@ class LottieEmbed extends MarkdownRenderChild {
     this.containerEl.addClass("lottie-thorvg");
     this.containerEl.dataset.renderer = this.plugin.settings.renderer;
 
-    const el = this.containerEl.createEl("canvas", {
-      attr: { id: `lottie-thorvg-${nextCanvasId++}` },
-    });
-
-    // ThorVG addresses the canvas by CSS selector, so it has to be in the
-    // document before the engine looks it up — and an animation scrolled out of
-    // view has no reason to burn frames. One observer covers both.
+    // An animation scrolled out of view has no reason to burn frames. The
+    // container is watched rather than the canvas, which is replaced whenever
+    // the file is redrawn.
     this.observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) void this.start(el);
+      if (entries.some((entry) => entry.isIntersecting)) void this.start();
       else this.animation?.pause();
     });
-    this.observer.observe(el);
+    this.observer.observe(this.containerEl);
 
     // Editing the alias in Live Preview does not rebuild the widget: Obsidian
     // reuses the DOM and just rewrites these attributes. For an image it also
@@ -247,17 +257,23 @@ class LottieEmbed extends MarkdownRenderChild {
     this.teardown();
   }
 
-  /**
-   * Releases the ThorVG objects. Must run while their engine is still alive:
-   * webcanvas zeroes an object's finalizer token only after its native free
-   * succeeds, so a dispose() against a terminated module leaves a finalizer
-   * that later fires into whatever module has replaced it.
-   */
+  /** Retires the embed for good; it will not draw again. */
   teardown(): void {
     if (this.tornDown) return;
     this.tornDown = true;
     this.observer?.disconnect();
     this.aliasObserver?.disconnect();
+    this.release();
+  }
+
+  /**
+   * Frees the ThorVG objects, leaving the embed able to draw again. Must run
+   * while their engine is still alive: webcanvas zeroes an object's finalizer
+   * token only after its native free succeeds, so a dispose() against a
+   * terminated module leaves a finalizer that later fires into whatever module
+   * has replaced it.
+   */
+  private release(): void {
     try {
       this.animation?.dispose();
       this.canvas?.destroy();
@@ -267,6 +283,32 @@ class LottieEmbed extends MarkdownRenderChild {
     this.animation = null;
     this.canvas = null;
     this.picture = null;
+    this.nativeSize = null;
+  }
+
+  /**
+   * Redraws after the file changed on disk, the way Obsidian's own embeds
+   * reload. Text that is not JSON at all is left alone rather than replacing a
+   * working animation, since an editor saving over the file can be caught
+   * mid-write; JSON that is simply no longer an animation is a real change and
+   * gets the file card.
+   */
+  async reload(): Promise<void> {
+    if (this.tornDown || !this.started) return;
+    try {
+      const json = await this.plugin.app.vault.cachedRead(this.file);
+      if (!isLottieJson(json)) {
+        this.release();
+        this.showGenericCard();
+        return;
+      }
+
+      const TVG = await this.plugin.engine();
+      if (this.tornDown) return;
+      this.draw(json, TVG);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   /**
@@ -290,7 +332,7 @@ class LottieEmbed extends MarkdownRenderChild {
     canvas.update().render();
   }
 
-  private async start(el: HTMLCanvasElement): Promise<void> {
+  private async start(): Promise<void> {
     if (this.started) {
       this.resume();
       return;
@@ -315,30 +357,46 @@ class LottieEmbed extends MarkdownRenderChild {
       // The awaits above give the note time to close underneath us.
       if (this.tornDown) return;
 
-      const animation = new TVG.LottieAnimation();
-      animation.load(json);
-
-      const picture = animation.picture;
-      if (!picture) throw new Error("ThorVG could not load the animation");
-
-      const { width, height } = picture.size();
-      this.nativeSize = { width, height };
-      const { drawWidth, drawHeight } = this.drawSize(width, height);
-
-      const canvas = new TVG.Canvas(`#${el.id}`, {
-        width: drawWidth,
-        height: drawHeight,
-      });
-      picture.size(drawWidth, drawHeight);
-      canvas.add(picture);
-
-      this.picture = picture;
-      this.animation = animation;
-      this.canvas = canvas;
-      this.resume();
+      this.draw(json, TVG);
     } catch (error) {
       this.fail(error);
     }
+  }
+
+  /**
+   * Builds the animation onto a fresh canvas. The old objects go first, and
+   * the element with them: ThorVG binds a rendering context to the canvas it
+   * is given, and reusing one across engines is not worth the risk.
+   */
+  private draw(json: string, TVG: ThorVGNamespace): void {
+    this.release();
+    this.containerEl.empty();
+    this.containerEl.addClass("lottie-thorvg");
+    const el = this.containerEl.createEl("canvas", {
+      attr: { id: `lottie-thorvg-${nextCanvasId++}` },
+    });
+
+    const animation = new TVG.LottieAnimation();
+    animation.load(json);
+
+    const picture = animation.picture;
+    if (!picture) throw new Error("ThorVG could not load the animation");
+
+    const { width, height } = picture.size();
+    this.nativeSize = { width, height };
+    const { drawWidth, drawHeight } = this.drawSize(width, height);
+
+    const canvas = new TVG.Canvas(`#${el.id}`, {
+      width: drawWidth,
+      height: drawHeight,
+    });
+    picture.size(drawWidth, drawHeight);
+    canvas.add(picture);
+
+    this.picture = picture;
+    this.animation = animation;
+    this.canvas = canvas;
+    this.resume();
   }
 
   /**
@@ -417,7 +475,20 @@ export default class LottiePlugin extends Plugin {
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.addSettingTab(new LottieSettingTab(this.app, this));
-    this.index = this.addChild(new LottieIndex(this.app));
+    // A burst of saves from an external editor collapses into one redraw. The
+    // paths are collected rather than passed through the debouncer, which
+    // would keep only the last file of a batch.
+    const changed = new Set<TFile>();
+    const flush = debounce(() => {
+      for (const file of changed) this.reloadEmbedsOf(file);
+      changed.clear();
+    }, 150, true);
+    this.index = this.addChild(
+      new LottieIndex(this.app, (file) => {
+        changed.add(file);
+        flush();
+      }),
+    );
 
     const registry = embedRegistry(this.app);
     // registerExtension throws on a duplicate, and a plugin that failed to
@@ -474,6 +545,12 @@ export default class LottiePlugin extends Plugin {
       (await engine).term();
     } catch (error) {
       console.error("Lottie: failed to terminate engine", error);
+    }
+  }
+
+  private reloadEmbedsOf(file: TFile): void {
+    for (const embed of this.embeds) {
+      if (embed.file === file) void embed.reload();
     }
   }
 
