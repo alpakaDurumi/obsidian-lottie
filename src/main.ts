@@ -13,13 +13,56 @@ import {
 import ThorVG, {
   type Canvas,
   type LottieAnimation,
+  type Picture,
   type RendererType,
   type ThorVGNamespace,
 } from "@thorvg/webcanvas";
 import thorvgWasm from "thorvg-wasm";
 
-/** Widest an embedded animation is drawn; taller ones keep their aspect ratio. */
-const MAX_WIDTH = 400;
+/**
+ * The size an `![[…|300]]` or `![[…|300x200]]` alias asks for.
+ *
+ * Obsidian parses the alias itself and puts the result on the embed container
+ * as `width`/`height` attributes — in reading view through the markdown node's
+ * hProperties, in Live Preview through the widget's applyTitle(). For images it
+ * then copies them onto the `<img>`; nothing does that for our canvas, so the
+ * attributes are read back here. A missing or unparsable size leaves them off.
+ */
+function requestedSize(el: HTMLElement): { width: number; height: number } {
+  const read = (name: string) => {
+    const value = Number.parseInt(el.getAttribute(name) ?? "", 10);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  };
+  return { width: read("width"), height: read("height") };
+}
+
+/** Alignment keywords understood in an embed's alias. */
+const ALIGNMENTS = ["left", "center", "right"] as const;
+type Alignment = (typeof ALIGNMENTS)[number];
+
+/**
+ * The alignment an `![[…|center]]` alias asks for, or null for none.
+ *
+ * Anything Obsidian could not read as a size is left in `alt`, `|`-separated
+ * and otherwise untouched — `![[a.json|center|border]]` arrives as
+ * `"center|border"`, and a plain embed arrives as the file name. Alignment is
+ * therefore matched against whole segments, so a file called `centerpiece.json`
+ * is not mistaken for a flag, and unknown segments are ignored.
+ *
+ * When several alignments are given the last one wins, as a later CSS
+ * declaration overrides an earlier one — and as Obsidian's own alias parser
+ * already works, reading the size from the last segment. Resolving it here
+ * rather than in the stylesheet keeps the outcome from depending on the order
+ * the rules happen to sit in.
+ */
+function requestedAlignment(el: HTMLElement): Alignment | null {
+  let alignment: Alignment | null = null;
+  for (const segment of el.getAttribute("alt")?.split("|") ?? []) {
+    const token = segment.trim().toLowerCase();
+    alignment = ALIGNMENTS.find((value) => value === token) ?? alignment;
+  }
+  return alignment;
+}
 
 /** File extension claimed for `![[…]]` embeds. */
 const EXTENSION = "json";
@@ -152,7 +195,11 @@ let nextCanvasId = 0;
 class LottieEmbed extends MarkdownRenderChild {
   private canvas: Canvas | null = null;
   private animation: LottieAnimation | null = null;
+  private picture: Picture | null = null;
+  /** The animation's own dimensions, before any alias size is applied. */
+  private nativeSize: { width: number; height: number } | null = null;
   private observer: IntersectionObserver | null = null;
+  private aliasObserver: MutationObserver | null = null;
   private started = false;
   private tornDown = false;
 
@@ -183,6 +230,16 @@ class LottieEmbed extends MarkdownRenderChild {
       else this.animation?.pause();
     });
     this.observer.observe(el);
+
+    // Editing the alias in Live Preview does not rebuild the widget: Obsidian
+    // reuses the DOM and just rewrites these attributes. For an image it also
+    // re-applies them to the <img>, but nothing tells a foreign child, so the
+    // change has to be picked up from the container itself.
+    this.aliasObserver = new MutationObserver(() => this.applyAlias());
+    this.aliasObserver.observe(this.containerEl, {
+      attributes: true,
+      attributeFilter: ["width", "height", "alt"],
+    });
   }
 
   onunload(): void {
@@ -200,6 +257,7 @@ class LottieEmbed extends MarkdownRenderChild {
     if (this.tornDown) return;
     this.tornDown = true;
     this.observer?.disconnect();
+    this.aliasObserver?.disconnect();
     try {
       this.animation?.dispose();
       this.canvas?.destroy();
@@ -208,6 +266,28 @@ class LottieEmbed extends MarkdownRenderChild {
     }
     this.animation = null;
     this.canvas = null;
+    this.picture = null;
+  }
+
+  /**
+   * Applies whatever size and alignment the alias currently asks for. Safe to
+   * call before the animation exists — the size is then read again on start().
+   */
+  private applyAlias(): void {
+    const alignment = requestedAlignment(this.containerEl);
+    if (alignment) this.containerEl.dataset.align = alignment;
+    else delete this.containerEl.dataset.align;
+
+    const picture = this.picture;
+    const canvas = this.canvas;
+    if (!picture || !canvas || this.tornDown) return;
+
+    const native = this.nativeSize;
+    if (!native) return;
+    const { drawWidth, drawHeight } = this.drawSize(native.width, native.height);
+    canvas.resize(drawWidth, drawHeight);
+    picture.size(drawWidth, drawHeight);
+    canvas.update().render();
   }
 
   private async start(el: HTMLCanvasElement): Promise<void> {
@@ -216,6 +296,11 @@ class LottieEmbed extends MarkdownRenderChild {
       return;
     }
     this.started = true;
+    // In reading view the alias attributes are on the container from the
+    // start, but Live Preview builds the widget, calls loadFile(), and only
+    // then applies them. This runs off an IntersectionObserver callback, which
+    // is later than both.
+    this.applyAlias();
 
     try {
       const json = await this.plugin.app.vault.cachedRead(this.file);
@@ -237,9 +322,8 @@ class LottieEmbed extends MarkdownRenderChild {
       if (!picture) throw new Error("ThorVG could not load the animation");
 
       const { width, height } = picture.size();
-      const scale = Math.min(1, MAX_WIDTH / width);
-      const drawWidth = Math.round(width * scale);
-      const drawHeight = Math.round(height * scale);
+      this.nativeSize = { width, height };
+      const { drawWidth, drawHeight } = this.drawSize(width, height);
 
       const canvas = new TVG.Canvas(`#${el.id}`, {
         width: drawWidth,
@@ -248,12 +332,34 @@ class LottieEmbed extends MarkdownRenderChild {
       picture.size(drawWidth, drawHeight);
       canvas.add(picture);
 
+      this.picture = picture;
       this.animation = animation;
       this.canvas = canvas;
       this.resume();
     } catch (error) {
       this.fail(error);
     }
+  }
+
+  /**
+   * Picks the pixel size to draw at, following the rules images get here:
+   * a width alone scales by aspect ratio (enlarging if asked), a width and a
+   * height stretch to exactly that, and no size at all renders at the
+   * animation's own dimensions. Obsidian's parser cannot produce a height
+   * without a width, so that case does not arise.
+   */
+  private drawSize(width: number, height: number): { drawWidth: number; drawHeight: number } {
+    const asked = requestedSize(this.containerEl);
+    if (asked.width && asked.height) {
+      return { drawWidth: asked.width, drawHeight: asked.height };
+    }
+    if (asked.width) {
+      return {
+        drawWidth: asked.width,
+        drawHeight: Math.round((height * asked.width) / width),
+      };
+    }
+    return { drawWidth: Math.round(width), drawHeight: Math.round(height) };
   }
 
   // ThorVG drives its own frame loop but leaves painting to the caller, so each
@@ -275,6 +381,7 @@ class LottieEmbed extends MarkdownRenderChild {
     el.empty();
     el.removeClass("lottie-thorvg");
     delete el.dataset.renderer;
+    delete el.dataset.align;
     el.addClasses(["file-embed", "mod-generic"]);
     const title = el.createDiv({ cls: "file-embed-title" });
     setIcon(title.createSpan({ cls: "file-embed-icon" }), "file");

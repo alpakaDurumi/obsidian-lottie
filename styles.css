@@ -1,11 +1,28 @@
-.lottie-thorvg {
-  display: flex;
-  justify-content: center;
-}
-
+/* Without an alignment flag the embed sits in the text flow exactly where an
+   image would, so nothing is set here but the overflow guard. */
 .lottie-thorvg canvas {
   max-width: 100%;
   height: auto;
+}
+
+/* `![[a.json|center]]` and friends. Obsidian has no such concept for images
+   either — it leaves the word in `alt` and CSS snippets give it meaning; this
+   does the same, but reads the flag in the plugin so a note that names several
+   gets a predictable one rather than whichever rule sorts last. */
+.lottie-thorvg[data-align] {
+  display: block;
+}
+
+.lottie-thorvg[data-align="left"] {
+  text-align: left;
+}
+
+.lottie-thorvg[data-align="center"] {
+  text-align: center;
+}
+
+.lottie-thorvg[data-align="right"] {
+  text-align: right;
 }
 
 .lottie-thorvg-error {
