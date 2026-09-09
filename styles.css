@@ -29,3 +29,16 @@
   color: var(--text-error);
   font-size: var(--font-ui-small);
 }
+
+/* The tab a .json animation opens in. */
+.lottie-thorvg-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.lottie-thorvg-notice {
+  text-align: center;
+  color: var(--text-muted);
+}

@@ -1,6 +1,7 @@
 import {
   App,
   Component,
+  FileView,
   MarkdownRenderChild,
   MarkdownView,
   Plugin,
@@ -8,6 +9,7 @@ import {
   Setting,
   TAbstractFile,
   TFile,
+  WorkspaceLeaf,
   debounce,
   setIcon,
 } from "obsidian";
@@ -206,7 +208,21 @@ class LottieIndex extends Component {
 
 let nextCanvasId = 0;
 
-class LottieEmbed extends MarkdownRenderChild {
+/**
+ * Anything holding ThorVG objects for one file — an embed inside a note, or the
+ * view a `.json` opens in. The plugin tracks these so it can free them before
+ * tearing the engine down, and redraw them when the file changes.
+ */
+interface LottieSurface {
+  /** Null only for a view between files. */
+  readonly file: TFile | null;
+  /** Frees the ThorVG objects, leaving the surface able to draw again. */
+  release(): void;
+  /** Re-reads the file and draws it, if the surface is showing anything yet. */
+  redraw(): Promise<void>;
+}
+
+class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
   private canvas: Canvas | null = null;
   private animation: LottieAnimation | null = null;
   private picture: Picture | null = null;
@@ -227,7 +243,7 @@ class LottieEmbed extends MarkdownRenderChild {
 
   // Called by Obsidian's embed loader once the component is attached.
   async loadFile(): Promise<void> {
-    this.plugin.embeds.add(this);
+    this.plugin.surfaces.add(this);
     this.containerEl.empty();
     this.containerEl.addClass("lottie-thorvg");
     this.containerEl.dataset.renderer = this.plugin.settings.renderer;
@@ -253,7 +269,7 @@ class LottieEmbed extends MarkdownRenderChild {
   }
 
   onunload(): void {
-    this.plugin.embeds.delete(this);
+    this.plugin.surfaces.delete(this);
     this.teardown();
   }
 
@@ -273,7 +289,7 @@ class LottieEmbed extends MarkdownRenderChild {
    * terminated module leaves a finalizer that later fires into whatever module
    * has replaced it.
    */
-  private release(): void {
+  release(): void {
     try {
       this.animation?.dispose();
       this.canvas?.destroy();
@@ -293,7 +309,7 @@ class LottieEmbed extends MarkdownRenderChild {
    * mid-write; JSON that is simply no longer an animation is a real change and
    * gets the file card.
    */
-  async reload(): Promise<void> {
+  async redraw(): Promise<void> {
     if (this.tornDown || !this.started) return;
     try {
       const json = await this.plugin.app.vault.cachedRead(this.file);
@@ -456,14 +472,195 @@ class LottieEmbed extends MarkdownRenderChild {
   }
 }
 
+/** View type opening a `.json` animation on its own tab. */
+const VIEW_TYPE = "lottie";
+
+/**
+ * The tab a `.json` opens in. Without a view registered for the extension
+ * Obsidian hands the file to the operating system, which is how clicking a
+ * Lottie file in the explorer ends up in a text editor.
+ *
+ * Registration is per extension, so this claims every `.json`. One that is not
+ * an animation gets a note saying so and a way to open it outside Obsidian —
+ * the behaviour it had before.
+ */
+class LottieView extends FileView implements LottieSurface {
+  private canvas: Canvas | null = null;
+  private animation: LottieAnimation | null = null;
+  private picture: Picture | null = null;
+  private nativeSize: { width: number; height: number } | null = null;
+  private canvasEl: HTMLCanvasElement | null = null;
+  private visibility: IntersectionObserver | null = null;
+  /** Whether the pane is on screen; a background tab must not burn frames. */
+  private onScreen = true;
+
+  constructor(
+    leaf: WorkspaceLeaf,
+    private plugin: LottiePlugin,
+  ) {
+    super(leaf);
+  }
+
+  protected async onOpen(): Promise<void> {
+    // A tab that is not in front has no layout, so this covers both the
+    // background-tab case and a pane split off to the side, which stays on
+    // screen and keeps playing.
+    this.visibility = new IntersectionObserver((entries) => {
+      this.onScreen = entries.some((entry) => entry.isIntersecting);
+      if (this.onScreen) this.resume();
+      else this.animation?.pause();
+    });
+    this.visibility.observe(this.contentEl);
+  }
+
+  protected async onClose(): Promise<void> {
+    this.visibility?.disconnect();
+    this.visibility = null;
+    this.plugin.surfaces.delete(this);
+    this.release();
+  }
+
+  getViewType(): string {
+    return VIEW_TYPE;
+  }
+
+  getIcon(): string {
+    return "play-circle";
+  }
+
+  getDisplayText(): string {
+    return this.file?.basename ?? "Lottie";
+  }
+
+  async onLoadFile(file: TFile): Promise<void> {
+    this.plugin.surfaces.add(this);
+    await this.draw(file);
+  }
+
+  async onUnloadFile(): Promise<void> {
+    this.plugin.surfaces.delete(this);
+    this.release();
+  }
+
+  release(): void {
+    try {
+      this.animation?.dispose();
+      this.canvas?.destroy();
+    } catch (error) {
+      console.error("Lottie: failed to release a view", error);
+    }
+    this.animation = null;
+    this.canvas = null;
+    this.picture = null;
+    this.nativeSize = null;
+  }
+
+  async redraw(): Promise<void> {
+    if (this.file) await this.draw(this.file);
+  }
+
+  // The animation is rasterised at the size it is shown at, so a resized pane
+  // needs it drawn again rather than scaled.
+  onResize(): void {
+    this.fit();
+  }
+
+  private async draw(file: TFile): Promise<void> {
+    this.release();
+    const content = this.contentEl;
+    content.empty();
+    content.addClass("lottie-thorvg-view");
+
+    try {
+      const json = await this.app.vault.cachedRead(file);
+      this.plugin.index.remember(file, isLottieJson(json));
+      if (!isLottieJson(json)) {
+        this.showNotAnimation(file);
+        return;
+      }
+
+      const TVG = await this.plugin.engine();
+      if (this.file !== file) return;
+
+      this.canvasEl = content.createEl("canvas", {
+        attr: { id: `lottie-thorvg-${nextCanvasId++}` },
+      });
+
+      const animation = new TVG.LottieAnimation();
+      animation.load(json);
+
+      const picture = animation.picture;
+      if (!picture) throw new Error("ThorVG could not load the animation");
+
+      const { width, height } = picture.size();
+      this.nativeSize = { width, height };
+
+      const canvas = new TVG.Canvas(`#${this.canvasEl.id}`, { width, height });
+      canvas.add(picture);
+
+      this.picture = picture;
+      this.animation = animation;
+      this.canvas = canvas;
+
+      this.fit();
+      this.resume();
+    } catch (error) {
+      console.error("Lottie:", error);
+      content.empty();
+      content.createDiv({
+        cls: "lottie-thorvg-error",
+        text: `Could not render ${file.name}`,
+      });
+    }
+  }
+
+  /** ThorVG drives the frame loop but leaves painting to the caller. */
+  private resume(): void {
+    const canvas = this.canvas;
+    if (!canvas || !this.onScreen) return;
+    this.animation?.play(() => canvas.update().render());
+  }
+
+  /** Scales the animation to fill the pane, keeping its proportions. */
+  private fit(): void {
+    const { canvas, picture, nativeSize, canvasEl } = this;
+    if (!canvas || !picture || !nativeSize || !canvasEl) return;
+
+    const pane = this.contentEl.getBoundingClientRect();
+    if (pane.width < 1 || pane.height < 1) return;
+
+    const scale = Math.min(pane.width / nativeSize.width, pane.height / nativeSize.height);
+    const width = Math.max(1, Math.round(nativeSize.width * scale));
+    const height = Math.max(1, Math.round(nativeSize.height * scale));
+
+    canvas.resize(width, height);
+    picture.size(width, height);
+    canvas.update().render();
+  }
+
+  private showNotAnimation(file: TFile): void {
+    const box = this.contentEl.createDiv({ cls: "lottie-thorvg-notice" });
+    box.createEl("p", { text: `${file.name} is not a Lottie animation.` });
+    box
+      .createEl("button", { text: "Open in default app" })
+      .addEventListener("click", () => {
+        // Not in the public typings, but it is what Obsidian itself calls for
+        // a file no view can open.
+        (this.app as App & { openWithDefaultApp(path: string): void }).openWithDefaultApp(
+          file.path,
+        );
+      });
+  }
+}
+
 export default class LottiePlugin extends Plugin {
   settings: LottieSettings = { ...DEFAULT_SETTINGS };
 
   /** Backend the running engine was created with, for the settings screen. */
   activeRenderer: RendererType | null = null;
 
-  /** Every embed currently holding ThorVG objects. */
-  readonly embeds = new Set<LottieEmbed>();
+  /** Every embed and view currently holding ThorVG objects. */
+  readonly surfaces = new Set<LottieSurface>();
 
   index!: LottieIndex;
 
@@ -480,7 +677,7 @@ export default class LottiePlugin extends Plugin {
     // would keep only the last file of a batch.
     const changed = new Set<TFile>();
     const flush = debounce(() => {
-      for (const file of changed) this.reloadEmbedsOf(file);
+      for (const file of changed) this.redrawSurfacesOf(file);
       changed.clear();
     }, 150, true);
     this.index = this.addChild(
@@ -498,6 +695,11 @@ export default class LottiePlugin extends Plugin {
       this.index.isLottie(file) === false ? null : new LottieEmbed(ctx.containerEl, this, file),
     );
     this.register(() => registry.unregisterExtension(EXTENSION));
+
+    // Opening a `.json` from the file explorer: without this Obsidian passes
+    // the file to the operating system.
+    this.registerView(VIEW_TYPE, (leaf) => new LottieView(leaf, this));
+    this.registerExtensions([EXTENSION], VIEW_TYPE);
 
     // When the plugin is (re)enabled while notes are already open, Live
     // Preview keeps the widgets the previous instance built — canvases with no
@@ -528,15 +730,16 @@ export default class LottiePlugin extends Plugin {
     await this.saveData(this.settings);
 
     // term() drops the cached module so the next init() can pick a different
-    // backend; every open note is then rebuilt against the new engine, in both
-    // reading view and Live Preview.
+    // backend. Notes are rebuilt, which recreates their embeds; open Lottie
+    // views survive the switch and draw themselves again.
     await this.terminateEngine();
     await this.rebuildMarkdownViews();
+    for (const surface of this.surfaces) void surface.redraw();
   }
 
-  /** Releases every embed's objects first, then the engine — in that order. */
+  /** Releases every surface's objects first, then the engine — in that order. */
   private async terminateEngine(): Promise<void> {
-    for (const embed of this.embeds) embed.teardown();
+    for (const surface of this.surfaces) surface.release();
     const engine = this.enginePromise;
     this.enginePromise = null;
     this.activeRenderer = null;
@@ -548,9 +751,9 @@ export default class LottiePlugin extends Plugin {
     }
   }
 
-  private reloadEmbedsOf(file: TFile): void {
-    for (const embed of this.embeds) {
-      if (embed.file === file) void embed.reload();
+  private redrawSurfacesOf(file: TFile): void {
+    for (const surface of this.surfaces) {
+      if (surface.file === file) void surface.redraw();
     }
   }
 
