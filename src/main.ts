@@ -667,7 +667,11 @@ export default class LottiePlugin extends Plugin {
   private enginePromise: Promise<ThorVGNamespace> | null = null;
 
   async onload(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign(
+      {},
+      DEFAULT_SETTINGS,
+      (await this.loadData()) as Partial<LottieSettings>,
+    );
     this.addSettingTab(new LottieSettingTab(this.app, this));
     // A burst of saves from an external editor collapses into one redraw. The
     // paths are collected rather than passed through the debouncer, which
