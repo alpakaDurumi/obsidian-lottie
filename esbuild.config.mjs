@@ -1,9 +1,8 @@
 import esbuild from "esbuild";
-import builtins from "builtin-modules";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { createRequire } from "node:module";
+import { builtinModules, createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const prod = process.argv[2] === "production";
@@ -49,7 +48,7 @@ await esbuild.build({
   banner: { js: banner },
   entryPoints: ["src/main.ts"],
   bundle: true,
-  external: ["obsidian", "electron", ...builtins],
+  external: ["obsidian", "electron", ...builtinModules],
   format: "cjs",
   target: "es2022",
   platform: "browser",
