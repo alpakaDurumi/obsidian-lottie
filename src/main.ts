@@ -710,8 +710,11 @@ export default class LottiePlugin extends Plugin {
     if (this.app.workspace.layoutReady) await this.rebuildMarkdownViews();
   }
 
-  async onunload(): Promise<void> {
-    await this.terminateEngine();
+  // Obsidian calls onunload() without awaiting it. terminateEngine() frees
+  // every surface before its first await and catches its own errors, so the
+  // engine is left to finish shutting down on its own.
+  onunload(): void {
+    void this.terminateEngine();
   }
 
   engine(): Promise<ThorVGNamespace> {
