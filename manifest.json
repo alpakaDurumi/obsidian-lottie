@@ -2,7 +2,7 @@
   "id": "lottie",
   "name": "Lottie",
   "version": "0.1.0",
-  "minAppVersion": "1.4.0",
+  "minAppVersion": "1.13.0",
   "description": "Renders Lottie animations in notes with ThorVG.",
   "author": "Duram Kim",
   "authorUrl": "https://github.com/alpakaDurumi",

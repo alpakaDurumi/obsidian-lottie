@@ -6,7 +6,7 @@ import {
   MarkdownView,
   Plugin,
   PluginSettingTab,
-  Setting,
+  type SettingDefinitionItem,
   TAbstractFile,
   TFile,
   WorkspaceLeaf,
@@ -778,22 +778,29 @@ class LottieSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
-  display(): void {
-    this.containerEl.empty();
-
-    new Setting(this.containerEl)
-      .setName("Renderer")
-      .setDesc(
-        "ThorVG rendering backend. WebGL and WebGPU take one GPU context per " +
+  /**
+   * The renderer is drawn by a render callback rather than bound to its key
+   * with `control`: a bound control only stores the new value, while a switch
+   * has to go through setRenderer() to restart the engine.
+   */
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: "Renderer",
+        desc:
+          "ThorVG rendering backend. WebGL and WebGPU take one GPU context per " +
           "animation, and browsers cap how many a page may hold at once.",
-      )
-      .addDropdown((dropdown) => {
-        for (const [value, label] of Object.entries(RENDERER_LABELS)) {
-          dropdown.addOption(value, label);
-        }
-        dropdown
-          .setValue(this.plugin.settings.renderer)
-          .onChange((value) => void this.plugin.setRenderer(value as RendererType));
-      });
+        render: (setting) => {
+          setting.addDropdown((dropdown) => {
+            for (const [value, label] of Object.entries(RENDERER_LABELS)) {
+              dropdown.addOption(value, label);
+            }
+            dropdown
+              .setValue(this.plugin.settings.renderer)
+              .onChange((value) => void this.plugin.setRenderer(value as RendererType));
+          });
+        },
+      },
+    ];
   }
 }
