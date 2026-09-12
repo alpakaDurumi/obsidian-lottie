@@ -2,6 +2,8 @@
 
 An Obsidian plugin that plays Lottie animations inside your notes.
 
+![Lottie animation playing in a note](./images/showcase.gif)
+
 ## Features
 
 - **Embed like an image** — an animation plays where you put it in a note.
