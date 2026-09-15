@@ -209,6 +209,44 @@ class LottieIndex extends Component {
 let nextCanvasId = 0;
 
 /**
+ * Builds a canvas under `parent` and binds ThorVG to it.
+ *
+ * ThorVG is given a CSS selector and resolves it itself, against the global
+ * `document` — the wrapper does so to find the element it draws into, and the
+ * WASM module does so again to create a GPU context. In Obsidian that document
+ * is always the main window's, while `parent` may belong to a popout window,
+ * whose tree the lookup never reaches.
+ *
+ * So the element is created in the main window, bound there, and only then
+ * moved across. From that point ThorVG holds it by reference and never looks it
+ * up again, which is why a note dragged out of the window keeps playing. The
+ * three steps run without yielding, so nothing is painted in between.
+ *
+ * `window` is deliberate where a plugin usually reaches for `activeWindow`:
+ * the element has to be staged in the one document ThorVG will search, not in
+ * whichever window happens to be focused.
+ */
+function createCanvas(
+  TVG: ThorVGNamespace,
+  parent: HTMLElement,
+  size: { width: number; height: number },
+): { el: HTMLCanvasElement; canvas: Canvas } {
+  const el = window.document.body.createEl("canvas", {
+    attr: { id: `lottie-thorvg-${nextCanvasId++}` },
+  });
+  el.hide();
+  try {
+    const canvas = new TVG.Canvas(`#${el.id}`, size);
+    parent.appendChild(el);
+    el.show();
+    return { el, canvas };
+  } catch (error) {
+    el.remove();
+    throw error;
+  }
+}
+
+/**
  * Anything holding ThorVG objects for one file — an embed inside a note, or the
  * view a `.json` opens in. The plugin tracks these so it can free them before
  * tearing the engine down, and redraw them when the file changes.
@@ -388,9 +426,6 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     this.release();
     this.containerEl.empty();
     this.containerEl.addClass("lottie-thorvg");
-    const el = this.containerEl.createEl("canvas", {
-      attr: { id: `lottie-thorvg-${nextCanvasId++}` },
-    });
 
     const animation = new TVG.LottieAnimation();
     animation.load(json);
@@ -402,7 +437,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     this.nativeSize = { width, height };
     const { drawWidth, drawHeight } = this.drawSize(width, height);
 
-    const canvas = new TVG.Canvas(`#${el.id}`, {
+    const { canvas } = createCanvas(TVG, this.containerEl, {
       width: drawWidth,
       height: drawHeight,
     });
@@ -489,7 +524,6 @@ class LottieView extends FileView implements LottieSurface {
   private animation: LottieAnimation | null = null;
   private picture: Picture | null = null;
   private nativeSize: { width: number; height: number } | null = null;
-  private canvasEl: HTMLCanvasElement | null = null;
   private visibility: IntersectionObserver | null = null;
   /** Whether the pane is on screen; a background tab must not burn frames. */
   private onScreen = true;
@@ -582,10 +616,6 @@ class LottieView extends FileView implements LottieSurface {
       const TVG = await this.plugin.engine();
       if (this.file !== file) return;
 
-      this.canvasEl = content.createEl("canvas", {
-        attr: { id: `lottie-thorvg-${nextCanvasId++}` },
-      });
-
       const animation = new TVG.LottieAnimation();
       animation.load(json);
 
@@ -595,7 +625,7 @@ class LottieView extends FileView implements LottieSurface {
       const { width, height } = picture.size();
       this.nativeSize = { width, height };
 
-      const canvas = new TVG.Canvas(`#${this.canvasEl.id}`, { width, height });
+      const { canvas } = createCanvas(TVG, content, { width, height });
       canvas.add(picture);
 
       this.picture = picture;
@@ -623,8 +653,8 @@ class LottieView extends FileView implements LottieSurface {
 
   /** Scales the animation to fill the pane, keeping its proportions. */
   private fit(): void {
-    const { canvas, picture, nativeSize, canvasEl } = this;
-    if (!canvas || !picture || !nativeSize || !canvasEl) return;
+    const { canvas, picture, nativeSize } = this;
+    if (!canvas || !picture || !nativeSize) return;
 
     const pane = this.contentEl.getBoundingClientRect();
     if (pane.width < 1 || pane.height < 1) return;
