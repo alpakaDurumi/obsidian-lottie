@@ -1,7 +1,7 @@
 {
   "id": "lottie",
   "name": "Lottie",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.13.0",
   "description": "Renders Lottie animations in notes with ThorVG.",
   "author": "Duram Kim",
