@@ -332,16 +332,16 @@ class Slot {
   seen = 0;
   /** Set if ThorVG refused a frame, so one bad animation stops only itself. */
   stalled = false;
-  /** Set once the renderer has let it go, whether asked to or to make room. */
+  /** Set once the player has let it go, whether asked to or to make room. */
   released = false;
 
-  /** Where the pixels are copied to, when a renderer copies them. */
+  /** Where the pixels are copied to, when a player copies them. */
   target: CanvasRenderingContext2D | null = null;
   /** The animation's own ThorVG canvas, when it draws into one. */
   canvas: Canvas | null = null;
 
   constructor(
-    private renderer: Renderer,
+    private player: Player,
     readonly animation: LottieAnimation,
     readonly picture: Picture,
     readonly targetEl: HTMLCanvasElement,
@@ -354,28 +354,28 @@ class Slot {
   ) {}
 
   show(): void {
-    this.renderer.show(this);
+    this.player.show(this);
   }
 
   hide(): void {
-    this.renderer.hide(this);
+    this.player.hide(this);
   }
 
   resize(width: number, height: number): void {
-    this.renderer.resize(this, width, height);
+    this.player.resize(this, width, height);
   }
 
   release(): void {
-    this.renderer.release(this);
+    this.player.release(this);
   }
 }
 
 /**
- * Everything the two renderers share: which animations are loaded, when they
+ * Everything the two players share: which animations are loaded, when they
  * are let in, and the single frame loop that advances them all. What differs
  * is where the pixels are drawn and how they reach the screen.
  */
-abstract class Renderer {
+abstract class Player {
   /** Everything loaded, on screen or not. */
   protected slots: Slot[] = [];
   private queue: Pending[] = [];
@@ -393,7 +393,7 @@ abstract class Renderer {
   protected abstract leave(slot: Slot): void;
   /** Draws one frame of everything on screen. */
   protected abstract paint(onScreen: Slot[]): void;
-  /** Frees whatever the renderer itself holds, after its slots are gone. */
+  /** Frees whatever the player itself holds, after its slots are gone. */
   protected abstract dispose(): void;
 
   /**
@@ -460,7 +460,7 @@ abstract class Renderer {
       }
       this.dispose();
     } catch (error) {
-      console.error("Lottie: failed to tear the renderer down", error);
+      console.error("Lottie: failed to tear the player down", error);
     }
   }
 
@@ -579,7 +579,7 @@ abstract class Renderer {
  * vault sidesteps that ceiling: a 2D canvas costs nothing, so a note may hold
  * as many as it likes.
  */
-class AtlasRenderer extends Renderer {
+class AtlasPlayer extends Player {
   /** Rows of the atlas; each takes slots no taller than itself. */
   private rows: { y: number; height: number; cursor: number }[] = [];
   private spare: Patch[] = [];
@@ -597,7 +597,7 @@ class AtlasRenderer extends Renderer {
    * ThorVG resolves its selector against the main window's document, so the
    * canvas it is bound to has to live there — whatever window an embed is in.
    */
-  static create(TVG: ThorVGNamespace): AtlasRenderer {
+  static create(TVG: ThorVGNamespace): AtlasPlayer {
     const host = window.document.body.createDiv({ cls: "lottie-thorvg-host" });
     const el = host.createEl("canvas", { attr: { id: `lottie-thorvg-${nextCanvasId++}` } });
     try {
@@ -606,7 +606,7 @@ class AtlasRenderer extends Renderer {
         height: ATLAS_MIN,
         enableDevicePixelRatio: false,
       });
-      return new AtlasRenderer(TVG, el, canvas);
+      return new AtlasPlayer(TVG, el, canvas);
     } catch (error) {
       host.remove();
       throw error;
@@ -756,7 +756,7 @@ class AtlasRenderer extends Renderer {
  * space too, and copying every animation a second time to get it out. It also
  * has no context to save: a software canvas costs nothing scarce.
  */
-class DirectRenderer extends Renderer {
+class DirectPlayer extends Player {
   protected enter(): void {}
   protected leave(): void {}
   protected dispose(): void {}
@@ -858,7 +858,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
           return;
         }
         // The slot outlives scrolling, so this is usually free. It is gone only
-        // if the renderer had to take it back to make room for something else.
+        // if the player had to take it back to make room for something else.
         if (this.slot && !this.slot.released) this.slot.show();
         else void this.attach();
       },
@@ -953,7 +953,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     this.place();
   }
 
-  /** Asks the renderer for a slot, which loads the animation to fill it. */
+  /** Asks the player for a slot, which loads the animation to fill it. */
   private async attach(): Promise<void> {
     if (this.attaching || this.tornDown) return;
     this.attaching = true;
@@ -971,14 +971,14 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
         this.place();
       }
 
-      const renderer = await this.plugin.renderer();
+      const player = await this.plugin.ensurePlayer();
       // The awaits above give the note time to close, or to scroll away.
       if (this.tornDown || !this.onScreen) return;
 
       // A Lottie that never said how large it is has had no canvas to lay out
       // with. It gets one at whatever size, and ThorVG's answer sizes it after.
       this.canvasEl ??= this.containerEl.createEl("canvas");
-      const slot = await renderer.acquire(
+      const slot = await player.acquire(
         json,
         this.canvasEl,
         () => this.onScreen && !this.tornDown,
@@ -1184,10 +1184,10 @@ class LottieView extends FileView implements LottieSurface {
         return;
       }
 
-      const renderer = await this.plugin.renderer();
+      const player = await this.plugin.ensurePlayer();
       if (this.file !== file || !this.onScreen || !this.canvasEl) return;
 
-      const slot = await renderer.acquire(
+      const slot = await player.acquire(
         json,
         this.canvasEl,
         () => this.file === file && this.onScreen,
@@ -1275,7 +1275,7 @@ export default class LottiePlugin extends Plugin {
   private queue: Promise<unknown> = Promise.resolve();
   /** ThorVG fixes its backend at init(), so the two live and die together. */
   private engine: ThorVGNamespace | null = null;
-  private current: Renderer | null = null;
+  private player: Player | null = null;
 
   async onload(): Promise<void> {
     this.settings = Object.assign(
@@ -1315,7 +1315,7 @@ export default class LottiePlugin extends Plugin {
 
     // When the plugin is (re)enabled while notes are already open, Live
     // Preview keeps the widgets the previous instance built — canvases with no
-    // renderer behind them. Rebuild those views so they pick this instance up.
+    // player behind them. Rebuild those views so they pick this instance up.
     // At startup layoutReady is still false and views render after plugins
     // load anyway, so nothing needs doing then.
     if (this.app.workspace.layoutReady) await this.rebuildMarkdownViews();
@@ -1332,7 +1332,7 @@ export default class LottiePlugin extends Plugin {
    * GPU ones pool onto a single canvas, which is what keeps them under
    * Chromium's ceiling on rendering contexts.
    */
-  renderer(): Promise<Renderer> {
+  ensurePlayer(): Promise<Player> {
     return this.transition(() => this.startEngine());
   }
 
@@ -1361,8 +1361,8 @@ export default class LottiePlugin extends Plugin {
     return next;
   }
 
-  private async startEngine(): Promise<Renderer> {
-    if (this.state === "ready" && this.current) return this.current;
+  private async startEngine(): Promise<Player> {
+    if (this.state === "ready" && this.player) return this.player;
 
     this.state = "starting";
     try {
@@ -1372,19 +1372,19 @@ export default class LottiePlugin extends Plugin {
         locateFile: () => wasmBlobUrl(),
       });
       this.engine = engine;
-      this.current = backend === "sw" ? new DirectRenderer(engine) : AtlasRenderer.create(engine);
+      this.player = backend === "sw" ? new DirectPlayer(engine) : AtlasPlayer.create(engine);
       this.state = "ready";
-      return this.current;
+      return this.player;
     } catch (error) {
       this.engine = null;
-      this.current = null;
+      this.player = null;
       this.state = "idle";
       throw error;
     }
   }
 
   /**
-   * Gives up every animation, then the renderer, then the engine — in that
+   * Gives up every animation, then the player, then the engine — in that
    * order. webcanvas zeroes an object's finalizer token only after its native
    * free succeeds, so a dispose() against a terminated module leaves a
    * finalizer that later fires into whatever module has replaced it.
@@ -1395,12 +1395,12 @@ export default class LottiePlugin extends Plugin {
     this.state = "stopping";
     for (const surface of this.surfaces) surface.release();
     try {
-      this.current?.destroy();
+      this.player?.destroy();
       this.engine?.term();
     } catch (error) {
       console.error("Lottie: failed to stop the engine", error);
     }
-    this.current = null;
+    this.player = null;
     this.engine = null;
     this.state = "idle";
   }
