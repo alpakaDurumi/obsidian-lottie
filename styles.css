@@ -5,6 +5,20 @@
   height: auto;
 }
 
+/* Holds the one canvas ThorVG draws on, which every animation is copied out of.
+   It has to be in the document for ThorVG to find it, but it is never looked
+   at, and it is sized to whatever is on screen — so it is kept in a box of no
+   size, out of the flow, where its dimensions cannot reach the layout. */
+.lottie-thorvg-host {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 /* `![[a.json|center]]` and friends. Obsidian has no such concept for images
    either — it leaves the word in `alt` and CSS snippets give it meaning; this
    does the same, but reads the flag in the plugin so a note that names several

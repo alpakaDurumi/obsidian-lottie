@@ -50,8 +50,8 @@ Obsidian hides file types it does not know, so `.json` files will not appear in 
 
 **Renderer** picks what draws the animations:
 
-- **Software** — draws on the CPU. Works everywhere, with no limit on how many animations a note can hold. The default.
-- **WebGL** and **WebGPU** — draw on the graphics card. Far faster for a demanding animation, but each one holds a graphics context and the browser keeps only about sixteen at a time; past that, animations stop rendering and do not come back. Worth switching to for a few heavy animations, not for a note full of them.
+- **Software** — draws on the CPU. Works everywhere. The default, and the one to go back to if an animation will not play or looks wrong.
+- **WebGL** and **WebGPU** — draw on the graphics card. Faster for demanding animations, and noticeably so on mobile.
 
 Changing it redraws everything on screen.
 
