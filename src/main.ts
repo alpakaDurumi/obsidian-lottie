@@ -1265,13 +1265,17 @@ export default class LottiePlugin extends Plugin {
 
   index!: LottieIndex;
 
-  // ThorVG caches its engine on the first init() and hands the same instance
-  // back to every later call, so one module is shared by everything and the
-  // renderer stays fixed until term() clears it.
-  private enginePromise: Promise<ThorVGNamespace> | null = null;
-  private rendererPromise: Promise<Renderer> | null = null;
-  /** The renderer once it exists, for the teardown paths that cannot wait. */
-  private shared: Renderer | null = null;
+  /**
+   * Where the plugin is in the life of its ThorVG engine. Starting one is
+   * asynchronous, and everything that ends it — switching backend, unloading —
+   * can be asked for while it is still starting, so no transition assumes what
+   * it will find: each queues on the last and reads this when its turn comes.
+   */
+  private state: "idle" | "starting" | "ready" | "stopping" = "idle";
+  private queue: Promise<unknown> = Promise.resolve();
+  /** ThorVG fixes its backend at init(), so the two live and die together. */
+  private engine: ThorVGNamespace | null = null;
+  private current: Renderer | null = null;
 
   async onload(): Promise<void> {
     this.settings = Object.assign(
@@ -1317,11 +1321,10 @@ export default class LottiePlugin extends Plugin {
     if (this.app.workspace.layoutReady) await this.rebuildMarkdownViews();
   }
 
-  // Obsidian calls onunload() without awaiting it. terminate() frees every
-  // surface and the renderer before its first await and catches its own
-  // errors, so the engine is left to finish shutting down on its own.
+  // Obsidian calls onunload() without awaiting it, so the engine is left to
+  // finish shutting down on its own.
   onunload(): void {
-    void this.terminate();
+    void this.transition(() => this.stopEngine());
   }
 
   /**
@@ -1330,14 +1333,7 @@ export default class LottiePlugin extends Plugin {
    * Chromium's ceiling on rendering contexts.
    */
   renderer(): Promise<Renderer> {
-    if (!this.rendererPromise) {
-      this.rendererPromise = this.engine().then((TVG) => {
-        this.shared =
-          this.settings.renderer === "sw" ? new DirectRenderer(TVG) : AtlasRenderer.create(TVG);
-        return this.shared;
-      });
-    }
-    return this.rendererPromise;
+    return this.transition(() => this.startEngine());
   }
 
   async setRenderer(renderer: RendererType): Promise<void> {
@@ -1345,22 +1341,46 @@ export default class LottiePlugin extends Plugin {
     this.settings.renderer = renderer;
     await this.saveData(this.settings);
 
-    // term() drops the cached module so the next init() can pick a different
-    // backend. Notes are rebuilt, which recreates their embeds; open Lottie
-    // views survive the switch and show themselves again.
-    await this.terminate();
-    await this.rebuildMarkdownViews();
-    for (const surface of this.surfaces) void surface.redraw();
+    // The engine has to go for the next one to pick a different backend. Notes
+    // are rebuilt, which recreates their embeds; open Lottie views survive the
+    // switch and show themselves again. Clicking through the dropdown fires one
+    // of these per choice, and two rebuilds at once leave CodeMirror reading a
+    // state it has already replaced, taking the note's embeds down with it — so
+    // this waits its turn like every other change of engine.
+    await this.transition(async () => {
+      await this.stopEngine();
+      await this.rebuildMarkdownViews();
+      for (const surface of this.surfaces) void surface.redraw();
+    });
   }
 
-  private engine(): Promise<ThorVGNamespace> {
-    if (!this.enginePromise) {
-      this.enginePromise = ThorVG.init({
-        renderer: this.settings.renderer,
+  /** Runs one change of engine, once the one before it has finished. */
+  private transition<T>(step: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(step);
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async startEngine(): Promise<Renderer> {
+    if (this.state === "ready" && this.current) return this.current;
+
+    this.state = "starting";
+    try {
+      const backend = this.settings.renderer;
+      const engine = await ThorVG.init({
+        renderer: backend,
         locateFile: () => wasmBlobUrl(),
       });
+      this.engine = engine;
+      this.current = backend === "sw" ? new DirectRenderer(engine) : AtlasRenderer.create(engine);
+      this.state = "ready";
+      return this.current;
+    } catch (error) {
+      this.engine = null;
+      this.current = null;
+      this.state = "idle";
+      throw error;
     }
-    return this.enginePromise;
   }
 
   /**
@@ -1369,20 +1389,20 @@ export default class LottiePlugin extends Plugin {
    * free succeeds, so a dispose() against a terminated module leaves a
    * finalizer that later fires into whatever module has replaced it.
    */
-  private async terminate(): Promise<void> {
-    for (const surface of this.surfaces) surface.release();
-    this.shared?.destroy();
-    this.shared = null;
-    this.rendererPromise = null;
+  private async stopEngine(): Promise<void> {
+    if (this.state === "idle") return;
 
-    const engine = this.enginePromise;
-    this.enginePromise = null;
-    if (!engine) return;
+    this.state = "stopping";
+    for (const surface of this.surfaces) surface.release();
     try {
-      (await engine).term();
+      this.current?.destroy();
+      this.engine?.term();
     } catch (error) {
-      console.error("Lottie: failed to terminate engine", error);
+      console.error("Lottie: failed to stop the engine", error);
     }
+    this.current = null;
+    this.engine = null;
+    this.state = "idle";
   }
 
   private redrawSurfacesOf(file: TFile): void {
