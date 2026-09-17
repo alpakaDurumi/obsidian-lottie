@@ -396,6 +396,15 @@ abstract class Player {
   /** Frees whatever the player itself holds, after its slots are gone. */
   protected abstract dispose(): void;
 
+  /** A broken player is replaced, never repaired. */
+  broken = false;
+
+  /** Stops drawing permanently. */
+  halt(): void {
+    this.broken = true;
+    this.stop();
+  }
+
   /**
    * Queues an animation to be loaded and given a place, and answers with its
    * slot once it has one — or with null if it was refused or is no longer
@@ -580,6 +589,8 @@ abstract class Player {
  * as many as it likes.
  */
 class AtlasPlayer extends Player {
+  /** Drops the context-loss listeners on dispose, instead of a flag each checks. */
+  private stopListening = new AbortController();
   /** Rows of the atlas; each takes slots no taller than itself. */
   private rows: { y: number; height: number; cursor: number }[] = [];
   private spare: Patch[] = [];
@@ -596,8 +607,15 @@ class AtlasPlayer extends Player {
   /**
    * ThorVG resolves its selector against the main window's document, so the
    * canvas it is bound to has to live there — whatever window an embed is in.
+   *
+   * `lost` and `restored` hear the graphics context go and come back. Chromium
+   * keeps sixteen of them and gives a page asking for one whichever it can
+   * spare, which may be this one; a GPU reset takes it as readily.
    */
-  static create(TVG: ThorVGNamespace): AtlasPlayer {
+  static create(
+    TVG: ThorVGNamespace,
+    context: { lost: () => void; restored: () => void },
+  ): AtlasPlayer {
     const host = window.document.body.createDiv({ cls: "lottie-thorvg-host" });
     const el = host.createEl("canvas", { attr: { id: `lottie-thorvg-${nextCanvasId++}` } });
     try {
@@ -606,7 +624,20 @@ class AtlasPlayer extends Player {
         height: ATLAS_MIN,
         enableDevicePixelRatio: false,
       });
-      return new AtlasPlayer(TVG, el, canvas);
+      const player = new AtlasPlayer(TVG, el, canvas);
+      const { signal } = player.stopListening;
+      el.addEventListener(
+        "webglcontextlost",
+        (event) => {
+          // Saying we mean to recover is what makes the browser try; left
+          // alone it never offers the context back at all.
+          event.preventDefault();
+          context.lost();
+        },
+        { signal },
+      );
+      el.addEventListener("webglcontextrestored", () => context.restored(), { signal });
+      return player;
     } catch (error) {
       host.remove();
       throw error;
@@ -622,6 +653,7 @@ class AtlasPlayer extends Player {
   }
 
   protected dispose(): void {
+    this.stopListening.abort();
     this.canvas.destroy();
     this.hostEl.parentElement?.remove();
   }
@@ -884,7 +916,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     this.teardown();
   }
 
-  /** Retires the embed for good; it will not draw again. */
+  /** Retires the embed permanently; it will not draw again. */
   teardown(): void {
     if (this.tornDown) return;
     this.tornDown = true;
@@ -905,7 +937,9 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
    * file card.
    */
   async redraw(): Promise<void> {
-    if (this.tornDown) return;
+    // Already reloading — a redraw asked for while attach() is in flight would
+    // only redo its read and parse, then find attach()'s own guard and stop.
+    if (this.tornDown || this.attaching) return;
     try {
       const json = await this.plugin.app.vault.cachedRead(this.file);
       const size = lottieSize(json);
@@ -1002,7 +1036,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     }
   }
 
-  /** Gives the animation up for good. The canvas keeps its last frame. */
+  /** Gives the animation up permanently. The canvas keeps its last frame. */
   private detach(): void {
     this.slot?.release();
     this.slot = null;
@@ -1139,6 +1173,8 @@ class LottieView extends FileView implements LottieSurface {
   }
 
   async redraw(): Promise<void> {
+    // Already reloading — see LottieEmbed.redraw() for why this is skipped.
+    if (this.attaching) return;
     if (this.file) await this.show(this.file);
   }
 
@@ -1350,8 +1386,40 @@ export default class LottiePlugin extends Plugin {
     await this.transition(async () => {
       await this.stopEngine();
       await this.rebuildMarkdownViews();
-      for (const surface of this.surfaces) void surface.redraw();
+      this.redrawAllSurfaces();
     });
+  }
+
+  /**
+   * Nothing can be drawn until a context comes back, and everything ThorVG had
+   * on the old one went with it, so the engine is only standing for as long as
+   * it takes to tear it down. Marking that rather than tearing down here leaves
+   * the decision to whoever asks next, which is how every other transition
+   * works — and tearing down here would abort this player's own context
+   * listeners before the browser has a chance to use them to tell us it's back.
+   */
+  private onContextLost(): void {
+    console.warn("Lottie: the graphics context was lost");
+    this.player?.halt();
+  }
+
+  /**
+   * Retrying is the browser's job rather than ours: it attempts a new context
+   * every second while the canvas is in a visible document, and gives back one
+   * evicted for room as soon as there is room. This is it saying it has.
+   */
+  private onContextRestored(): void {
+    void this.transition(async () => {
+      await this.stopEngine();
+      this.redrawAllSurfaces();
+    });
+  }
+
+  /** Tells everything currently tracked to reload, which lazily rebuilds the
+   *  engine too: the first redraw() to ask for a player builds it, and the
+   *  rest just get the one that built. */
+  private redrawAllSurfaces(): void {
+    for (const surface of this.surfaces) void surface.redraw();
   }
 
   /** Runs one change of engine, once the one before it has finished. */
@@ -1362,7 +1430,13 @@ export default class LottiePlugin extends Plugin {
   }
 
   private async startEngine(): Promise<Player> {
-    if (this.state === "ready" && this.player) return this.player;
+    let healing = false;
+    if (this.state === "ready" && this.player) {
+      if (!this.player.broken) return this.player;
+      // Draws nothing any more, so it goes before a new one goes up.
+      await this.stopEngine();
+      healing = true;
+    }
 
     this.state = "starting";
     try {
@@ -1372,8 +1446,17 @@ export default class LottiePlugin extends Plugin {
         locateFile: () => wasmBlobUrl(),
       });
       this.engine = engine;
-      this.player = backend === "sw" ? new DirectPlayer(engine) : AtlasPlayer.create(engine);
+      this.player =
+        backend === "sw"
+          ? new DirectPlayer(engine)
+          : AtlasPlayer.create(engine, {
+              lost: () => this.onContextLost(),
+              restored: () => this.onContextRestored(),
+            });
       this.state = "ready";
+      // stopEngine() above released every surface's slot; the caller is about
+      // to reattach itself, but the rest need telling too.
+      if (healing) this.redrawAllSurfaces();
       return this.player;
     } catch (error) {
       this.engine = null;
