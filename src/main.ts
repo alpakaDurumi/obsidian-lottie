@@ -880,7 +880,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
       return;
     }
     this.nativeSize = size;
-    this.place();
+    this.applyAlias();
 
     this.observer = new IntersectionObserver(
       (entries) => {
