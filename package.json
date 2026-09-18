@@ -7,6 +7,7 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
+    "lint": "eslint .",
     "build": "node esbuild.config.mjs production && node scripts/install.mjs",
     "dev": "node esbuild.config.mjs && node scripts/install.mjs",
     "version": "node scripts/version-bump.mjs && git add manifest.json versions.json"
