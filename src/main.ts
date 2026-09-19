@@ -67,6 +67,31 @@ function requestedAlignment(el: HTMLElement): Alignment | null {
   return alignment;
 }
 
+/**
+ * A segment of an alias that is an instruction and not words: an alignment
+ * keyword, or a size (`300`, `300x200`) that Obsidian left in `alt` because it
+ * was not the last segment.
+ */
+function isFlag(segment: string): boolean {
+  return (
+    /^\d+(x\d+)?$/i.test(segment) || ALIGNMENTS.some((value) => value === segment.toLowerCase())
+  );
+}
+
+/**
+ * The text an embed gives to assistive technology, or null if it gives none.
+ * That is its alias without the flags. A plain embed arrives with its own
+ * `src` in `alt`, which is a file name and not a description, so it is left out.
+ */
+function accessibleName(el: HTMLElement): string | null {
+  const src = el.getAttribute("src");
+  const words = (el.getAttribute("alt") ?? "")
+    .split("|")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== src && !isFlag(segment));
+  return words.join(", ") || null;
+}
+
 /** File extension claimed for `![[…]]` embeds. */
 const EXTENSION = "json";
 
@@ -616,7 +641,10 @@ class AtlasPlayer extends Player {
     TVG: ThorVGNamespace,
     context: { lost: () => void; restored: () => void },
   ): AtlasPlayer {
-    const host = window.document.body.createDiv({ cls: "lottie-thorvg-host" });
+    const host = window.document.body.createDiv({
+      cls: "lottie-thorvg-host",
+      attr: { "aria-hidden": "true" },
+    });
     const el = host.createEl("canvas", { attr: { id: `lottie-thorvg-${nextCanvasId++}` } });
     try {
       const canvas = new TVG.Canvas(`#${el.id}`, {
@@ -830,6 +858,28 @@ class DirectPlayer extends Player {
 }
 
 /**
+ * A canvas is only pixels, so a screen reader can say nothing about it unless
+ * it is given a role and a name. With no name it is decoration, and is hidden.
+ */
+function describeCanvas(el: HTMLCanvasElement, name: string | null): void {
+  if (name) {
+    el.setAttribute("role", "img");
+    el.setAttribute("aria-label", name);
+    el.removeAttribute("aria-hidden");
+  } else {
+    el.removeAttribute("role");
+    el.removeAttribute("aria-label");
+    el.setAttribute("aria-hidden", "true");
+  }
+}
+
+function createCanvas(parent: HTMLElement, name: string | null): HTMLCanvasElement {
+  const el = parent.createEl("canvas");
+  describeCanvas(el, name);
+  return el;
+}
+
+/**
  * An embed inside a note, or the view a `.json` opens in. The plugin tracks
  * these so it can free them before tearing the engine down, and reload them
  * when the file changes.
@@ -970,8 +1020,7 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
 
     const { drawWidth, drawHeight } = this.drawSize(native.width, native.height);
     const ratio = pixelRatio();
-    const el = this.canvasEl ?? this.containerEl.createEl("canvas");
-    this.canvasEl = el;
+    const el = this.ensureCanvas();
 
     el.width = Math.max(1, Math.round(drawWidth * ratio));
     el.height = Math.max(1, Math.round(drawHeight * ratio));
@@ -984,7 +1033,13 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     const alignment = requestedAlignment(this.containerEl);
     if (alignment) this.containerEl.dataset.align = alignment;
     else delete this.containerEl.dataset.align;
+    if (this.canvasEl) describeCanvas(this.canvasEl, accessibleName(this.containerEl));
     this.place();
+  }
+
+  private ensureCanvas(): HTMLCanvasElement {
+    this.canvasEl ??= createCanvas(this.containerEl, accessibleName(this.containerEl));
+    return this.canvasEl;
   }
 
   /** Asks the player for a slot, which loads the animation to fill it. */
@@ -1011,10 +1066,9 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
 
       // A Lottie that never said how large it is has had no canvas to lay out
       // with. It gets one at whatever size, and ThorVG's answer sizes it after.
-      this.canvasEl ??= this.containerEl.createEl("canvas");
       const slot = await player.acquire(
         json,
-        this.canvasEl,
+        this.ensureCanvas(),
         () => this.onScreen && !this.tornDown,
       );
       if (!slot) return;
@@ -1199,7 +1253,7 @@ class LottieView extends FileView implements LottieSurface {
     }
 
     this.nativeSize = size.width > 0 ? size : null;
-    this.canvasEl = content.createEl("canvas");
+    this.canvasEl = createCanvas(content, file.name);
     this.fit();
     await this.attach();
   }
