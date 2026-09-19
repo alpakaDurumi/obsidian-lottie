@@ -17,6 +17,7 @@ Follow the steps below to install Lottie.
 
 - **Embed like an image** — an animation plays where you put it in a note.
 - **Size and alignment** — the same syntax images take.
+- **Code blocks** — paste an animation's JSON into a `lottie` code block.
 - **Open on a tab** — clicking a file in the explorer plays it full pane.
 - **Live updates** — editing an animation in another program updates it in Obsidian straight away.
 - **Select rendering backends** — CPU, WebGL or WebGPU, switchable in settings.
@@ -39,6 +40,18 @@ Embed a `.json` animation the way you would embed an image:
 ```
 
 A size always comes last. If you write several alignments the last one is used, and anything that is not one of the three words is ignored.
+
+### Code blocks
+
+To embed an animation without a file, put its JSON in a `lottie` code block:
+
+````md
+```lottie
+{ "v": "5.7.0", "fr": 30, "ip": 0, "op": 60, "w": 512, "h": 512, "layers": [ ... ] }
+```
+````
+
+Size and alignment do not apply here. The animation is drawn at the size it was authored at.
 
 ### Opening a file on its own
 

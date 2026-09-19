@@ -44,6 +44,14 @@
   font-size: var(--font-ui-small);
 }
 
+/* Live Preview clips a block's edit button to the block, and the button is
+   taller than a line of text. This is the button's height (icon plus padding
+   above and below, as Obsidian sizes it) and the gap it keeps from the top,
+   mirrored at the bottom. */
+.markdown-source-view.mod-cm6 .block-language-lottie {
+  min-height: calc(var(--icon-size) + var(--size-2-2) * 4);
+}
+
 /* The tab a .json animation opens in. */
 .lottie-thorvg-view {
   display: flex;

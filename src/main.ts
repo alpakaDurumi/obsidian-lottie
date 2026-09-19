@@ -95,6 +95,9 @@ function accessibleName(el: HTMLElement): string | null {
 /** File extension claimed for `![[…]]` embeds. */
 const EXTENSION = "json";
 
+/** Language of the code blocks that hold an animation's JSON directly. */
+const CODE_BLOCK_LANGUAGE = "lottie";
+
 interface LottieSettings {
   renderer: RendererType;
 }
@@ -885,7 +888,7 @@ function createCanvas(parent: HTMLElement, name: string | null): HTMLCanvasEleme
  * when the file changes.
  */
 interface LottieSurface {
-  /** Null only for a view between files. */
+  /** Null for a code block, which has no file, and for a view between files. */
   readonly file: TFile | null;
   /** Gives up the animation's slot, leaving the surface able to take another. */
   release(): void;
@@ -893,7 +896,18 @@ interface LottieSurface {
   redraw(): Promise<void>;
 }
 
-class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
+/** What reading an animation yields: its text, and its size if it is one. */
+interface Reading {
+  json: string;
+  size: Size | null;
+}
+
+/**
+ * An animation shown inline in a note. The kinds of embed differ in where the
+ * JSON comes from and in what is shown when it is not a Lottie document, and
+ * share everything else.
+ */
+abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
   private canvasEl: HTMLCanvasElement | null = null;
   private slot: Slot | null = null;
   /** The animation's own dimensions, before any alias size is applied. */
@@ -904,15 +918,26 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
   private attaching = false;
   private tornDown = false;
 
+  abstract readonly file: TFile | null;
+  /** What the embed is called in an error message. */
+  protected abstract readonly name: string;
+
   constructor(
     containerEl: HTMLElement,
-    private plugin: LottiePlugin,
-    readonly file: TFile,
+    protected plugin: LottiePlugin,
   ) {
     super(containerEl);
   }
 
-  // Called by Obsidian's embed loader once the component is attached.
+  /** The size from the cheapest place there is, so the note can be laid out first. */
+  protected abstract measure(): Promise<Size | null>;
+  /** Reads the animation afresh. */
+  protected abstract read(): Promise<Reading>;
+  /** Fills the container in place of an animation, for a source that is not one. */
+  protected abstract fillNotLottie(el: HTMLElement): void;
+
+  // Called by Obsidian's embed loader, or by the code block processor, once
+  // the component is attached.
   async loadFile(): Promise<void> {
     this.plugin.surfaces.add(this);
     this.containerEl.empty();
@@ -923,10 +948,10 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     // whether the embed is on screen, and an embed that has not drawn has no
     // position worth asking about — nor can its neighbours have one while it
     // sits between them with no size.
-    const size = await this.plugin.index.ensure(this.file);
+    const size = await this.measure();
     if (this.tornDown) return;
     if (!size) {
-      this.showGenericCard();
+      this.showNotLottie();
       return;
     }
     this.nativeSize = size;
@@ -991,11 +1016,10 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     // only redo its read and parse, then find attach()'s own guard and stop.
     if (this.tornDown || this.attaching) return;
     try {
-      const json = await this.plugin.app.vault.cachedRead(this.file);
-      const size = lottieSize(json);
+      const { size } = await this.read();
       if (!size) {
         this.detach();
-        this.showGenericCard();
+        this.showNotLottie();
         return;
       }
       if (size.width > 0) {
@@ -1047,11 +1071,9 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     if (this.attaching || this.tornDown) return;
     this.attaching = true;
     try {
-      const json = await this.plugin.app.vault.cachedRead(this.file);
-      const size = lottieSize(json);
-      this.plugin.index.remember(this.file, size);
+      const { json, size } = await this.read();
       if (!size) {
-        this.showGenericCard();
+        this.showNotLottie();
         return;
       }
       // A file with no size of its own could not be laid out until now.
@@ -1117,24 +1139,12 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     return { drawWidth: Math.round(width), drawHeight: Math.round(height) };
   }
 
-  /**
-   * A `.json` that is not a Lottie document gets the same card Obsidian shows
-   * for any other file. From now on the index knows the file, so the next
-   * render skips this component entirely and Obsidian draws its own card.
-   */
-  private showGenericCard(): void {
+  private showNotLottie(): void {
     this.detach();
     this.observer?.disconnect();
-    const el = this.containerEl;
-    el.empty();
+    this.containerEl.empty();
     this.canvasEl = null;
-    el.removeClass("lottie-thorvg");
-    delete el.dataset.renderer;
-    delete el.dataset.align;
-    el.addClasses(["file-embed", "mod-generic"]);
-    const title = el.createDiv({ cls: "file-embed-title" });
-    setIcon(title.createSpan({ cls: "file-embed-icon" }), "file");
-    title.appendText(this.file.name);
+    this.fillNotLottie(this.containerEl);
   }
 
   private fail(error: unknown): void {
@@ -1144,8 +1154,77 @@ class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
     this.canvasEl = null;
     this.containerEl.createDiv({
       cls: "lottie-thorvg-error",
-      text: `Could not render ${this.file.name}`,
+      text: `Could not render ${this.name}`,
     });
+  }
+}
+
+/** An embed of a `.json` file, as in `![[a.json]]`. */
+class FileEmbed extends LottieEmbed {
+  constructor(
+    containerEl: HTMLElement,
+    plugin: LottiePlugin,
+    readonly file: TFile,
+  ) {
+    super(containerEl, plugin);
+  }
+
+  protected get name(): string {
+    return this.file.name;
+  }
+
+  protected measure(): Promise<Size | null> {
+    return this.plugin.index.ensure(this.file);
+  }
+
+  protected async read(): Promise<Reading> {
+    const json = await this.plugin.app.vault.cachedRead(this.file);
+    const size = lottieSize(json);
+    this.plugin.index.remember(this.file, size);
+    return { json, size };
+  }
+
+  /**
+   * A `.json` that is not a Lottie document gets the same card Obsidian shows
+   * for any other file. From now on the index knows the file, so the next
+   * render skips this component entirely and Obsidian draws its own card.
+   */
+  protected fillNotLottie(el: HTMLElement): void {
+    el.removeClass("lottie-thorvg");
+    delete el.dataset.renderer;
+    delete el.dataset.align;
+    el.addClasses(["file-embed", "mod-generic"]);
+    const title = el.createDiv({ cls: "file-embed-title" });
+    setIcon(title.createSpan({ cls: "file-embed-icon" }), "file");
+    title.appendText(this.file.name);
+  }
+}
+
+/** A `lottie` code block, whose animation is the text of the block itself. */
+class BlockEmbed extends LottieEmbed {
+  readonly file = null;
+  protected readonly name = "lottie code block";
+  private readonly size: Size | null;
+
+  constructor(
+    containerEl: HTMLElement,
+    plugin: LottiePlugin,
+    private text: string,
+  ) {
+    super(containerEl, plugin);
+    this.size = lottieSize(text);
+  }
+
+  protected measure(): Promise<Size | null> {
+    return Promise.resolve(this.size);
+  }
+
+  protected read(): Promise<Reading> {
+    return Promise.resolve({ json: this.text, size: this.size });
+  }
+
+  protected fillNotLottie(el: HTMLElement): void {
+    el.createDiv({ cls: "lottie-thorvg-error", text: "Not a Lottie animation" });
   }
 }
 
@@ -1394,7 +1473,7 @@ export default class LottiePlugin extends Plugin {
     // unload cleanly (or another plugin) may already hold the extension.
     if (registry.isExtensionRegistered(EXTENSION)) registry.unregisterExtension(EXTENSION);
     registry.registerExtension(EXTENSION, (ctx, file) =>
-      this.index.isLottie(file) === false ? null : new LottieEmbed(ctx.containerEl, this, file),
+      this.index.isLottie(file) === false ? null : new FileEmbed(ctx.containerEl, this, file),
     );
     this.register(() => registry.unregisterExtension(EXTENSION));
 
@@ -1402,6 +1481,12 @@ export default class LottiePlugin extends Plugin {
     // the file to the operating system.
     this.registerView(VIEW_TYPE, (leaf) => new LottieView(leaf, this));
     this.registerExtensions([EXTENSION], VIEW_TYPE);
+
+    this.registerMarkdownCodeBlockProcessor(CODE_BLOCK_LANGUAGE, async (source, el, ctx) => {
+      const block = new BlockEmbed(el, this, source);
+      ctx.addChild(block);
+      await block.loadFile();
+    });
 
     // When the plugin is (re)enabled while notes are already open, Live
     // Preview keeps the widgets the previous instance built — canvases with no
