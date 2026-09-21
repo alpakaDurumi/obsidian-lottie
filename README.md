@@ -19,6 +19,7 @@ Follow the steps below to install Lottie.
 - **Size and alignment** — the same syntax images take.
 - **Code blocks** — paste an animation's JSON into a `lottie` code block.
 - **Open on a tab** — clicking a file in the explorer plays it full pane.
+- **Pause and play** — a button on each animation stops it on the current frame.
 - **Live updates** — editing an animation in another program updates it in Obsidian straight away.
 - **Select rendering backends** — CPU, WebGL or WebGPU, switchable in settings.
 
@@ -58,6 +59,10 @@ Size and alignment do not apply here. The animation is drawn at the size it was 
 Clicking a `.json` in the file explorer opens the animation on a tab, scaled to fill the pane.
 
 Obsidian hides file types it does not know, so `.json` files will not appear in the explorer until you turn on **Settings → Files and links → Detect all file extensions**. Embedding them in a note works either way.
+
+### Pausing
+
+Every animation has a pause button in its bottom-left corner. It appears when you hover over the animation and stays visible while the animation is paused. Press it again to play on from the same frame. On a touch device the button is always shown.
 
 ### Settings
 

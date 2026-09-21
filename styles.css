@@ -5,6 +5,41 @@
   height: auto;
 }
 
+/* The canvas and its pause button, in a box of the canvas's size. The canvas is
+   a block inside it, so the box sits on the line the way the canvas alone did. */
+.lottie-thorvg-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.lottie-thorvg-stage canvas {
+  display: block;
+}
+
+/* Bottom left, where a video keeps its play button. Shown while the pointer is
+   over the animation, while the button has keyboard focus and while paused.
+   A device that cannot hover shows it all the time. */
+.lottie-thorvg-toggle {
+  position: absolute;
+  left: var(--size-4-2);
+  bottom: var(--size-4-2);
+  background-color: var(--background-primary);
+  opacity: 0;
+}
+
+.lottie-thorvg-stage:hover .lottie-thorvg-toggle,
+.lottie-thorvg-stage[data-paused] .lottie-thorvg-toggle,
+.lottie-thorvg-toggle:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .lottie-thorvg-toggle {
+    opacity: 1;
+  }
+}
+
 /* Holds the one canvas ThorVG draws on, which every animation is copied out of.
    It has to be in the document for ThorVG to find it, but it is never looked
    at, and it is sized to whatever is on screen — so it is kept in a box of no

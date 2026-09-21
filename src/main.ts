@@ -362,6 +362,15 @@ class Slot {
   stalled = false;
   /** Set once the player has let it go, whether asked to or to make room. */
   released = false;
+  /** Paused by the viewer. Its frame stays put, and its canvas keeps showing it. */
+  paused = false;
+  /**
+   * Its canvas does not show its frame, because the slot is new or the canvas
+   * was just sized. Even a paused slot is drawn once more to clear this.
+   */
+  dirty = true;
+  /** Part of what the player draws each frame. */
+  inScene = false;
 
   /** Where the pixels are copied to, when a player copies them. */
   target: CanvasRenderingContext2D | null = null;
@@ -387,6 +396,18 @@ class Slot {
 
   hide(): void {
     this.player.hide(this);
+  }
+
+  pause(): void {
+    this.player.pause(this);
+  }
+
+  play(): void {
+    this.player.play(this);
+  }
+
+  seek(frame: number): void {
+    this.player.seek(this, frame);
   }
 
   resize(width: number, height: number): void {
@@ -416,11 +437,11 @@ abstract class Player {
   protected abstract place(slot: Slot): boolean;
   /** Takes that away, before the slot is placed again or forgotten. */
   protected abstract displace(slot: Slot): void;
-  /** The slot has come on screen, or gone off it. */
+  /** The slot has joined the scene, or left it. */
   protected abstract enter(slot: Slot): void;
   protected abstract leave(slot: Slot): void;
-  /** Draws one frame of everything on screen. */
-  protected abstract paint(onScreen: Slot[]): void;
+  /** Draws one frame of everything in the scene. */
+  protected abstract paint(scene: Slot[]): void;
   /** Frees whatever the player itself holds, after its slots are gone. */
   protected abstract dispose(): void;
 
@@ -445,13 +466,12 @@ abstract class Player {
     });
   }
 
-  /** The animation is on screen again, so the next frame draws it. */
+  /** The animation is on screen again. Unless it is paused, the next frame draws it. */
   show(slot: Slot): void {
     if (slot.visible || slot.released) return;
     slot.visible = true;
     slot.seen = performance.now();
-    this.enter(slot);
-    this.start();
+    this.sync(slot);
   }
 
   /** Off screen. It keeps its place, and its canvas keeps the last frame. */
@@ -459,16 +479,50 @@ abstract class Player {
     if (!slot.visible || slot.released) return;
     slot.visible = false;
     slot.seen = performance.now();
-    this.leave(slot);
+    this.sync(slot);
   }
 
+  /** Stops the animation at its current frame, which its canvas keeps showing. */
+  pause(slot: Slot): void {
+    if (slot.paused || slot.released) return;
+    slot.paused = true;
+    this.sync(slot);
+  }
+
+  /** Carries on from the frame it was paused at. */
+  play(slot: Slot): void {
+    if (!slot.paused || slot.released) return;
+    slot.paused = false;
+    this.sync(slot);
+  }
+
+  /** Moves the animation to a frame. Even a paused slot is drawn once at it. */
+  seek(slot: Slot, frame: number): void {
+    if (slot.released || frame === slot.frame) return;
+    slot.frame = frame;
+    this.applyFrame(slot);
+    slot.dirty = true;
+    this.sync(slot);
+  }
+
+  /**
+   * Called right after the caller has sized the slot's canvas. That clears the
+   * canvas even when the size is unchanged, so the slot is owed a frame.
+   */
   resize(slot: Slot, width: number, height: number): void {
+    if (slot.released) return;
+    slot.dirty = true;
     const next = { width: Math.max(1, width), height: Math.max(1, height) };
-    if (slot.released || (next.width === slot.width && next.height === slot.height)) return;
-    this.displace(slot);
-    slot.width = next.width;
-    slot.height = next.height;
-    if (!this.place(slot)) this.release(slot);
+    if (next.width !== slot.width || next.height !== slot.height) {
+      this.displace(slot);
+      slot.width = next.width;
+      slot.height = next.height;
+      if (!this.place(slot)) {
+        this.release(slot);
+        return;
+      }
+    }
+    this.sync(slot);
   }
 
   release(slot: Slot): void {
@@ -477,7 +531,7 @@ abstract class Player {
     this.slots.splice(at, 1);
     slot.released = true;
     try {
-      if (slot.visible) this.leave(slot);
+      if (slot.inScene) this.leave(slot);
       this.displace(slot);
       slot.animation.dispose();
     } catch (error) {
@@ -551,6 +605,32 @@ abstract class Player {
     }
   }
 
+  /**
+   * Puts the slot in the scene or takes it out. A paused slot is in only while
+   * it is owed a frame. After that its canvas holds the frame it stopped on.
+   */
+  private sync(slot: Slot): void {
+    const wanted = slot.visible && (!slot.paused || slot.dirty);
+    if (wanted === slot.inScene) return;
+    slot.inScene = wanted;
+    if (wanted) {
+      this.enter(slot);
+      this.start();
+    } else {
+      this.leave(slot);
+    }
+  }
+
+  /** Hands the slot's frame to ThorVG. A refusal stops only this slot. */
+  private applyFrame(slot: Slot): void {
+    try {
+      slot.animation.frame(slot.frame);
+    } catch (error) {
+      slot.stalled = true;
+      console.error("Lottie: could not advance an animation", error);
+    }
+  }
+
   private start(): void {
     if (this.frameId !== null) return;
     this.lastTick = 0;
@@ -564,10 +644,11 @@ abstract class Player {
   }
 
   /**
-   * One loop and one render for every animation on screen; ThorVG's own play()
-   * would drive a frame loop each. Off-screen slots keep counting so that one
-   * scrolled back into view has moved on with the rest, but they are not asked
-   * to draw. With nothing on screen at all the loop stops, and time with it.
+   * One loop and one render for every animation in the scene. ThorVG's own
+   * play() would drive a frame loop each. Off-screen slots keep counting so
+   * that one scrolled back into view has moved on with the rest, but they are
+   * not asked to draw. Paused slots do not count. With nothing to draw the loop
+   * stops, and time with it.
    */
   private tick = (now: number): void => {
     this.frameId = window.requestAnimationFrame(this.tick);
@@ -577,29 +658,28 @@ abstract class Player {
     this.admit();
 
     for (const slot of this.slots) {
-      if (slot.stalled) continue;
+      if (slot.stalled || slot.paused) continue;
       // ThorVG treats a frame it is already showing as a failure, and the first
       // tick of a new slot asks for exactly that.
       const frame = (slot.frame + slot.fps * elapsed) % slot.frames;
       if (frame === slot.frame) continue;
       slot.frame = frame;
-      if (!slot.visible) continue;
-      try {
-        slot.animation.frame(frame);
-      } catch (error) {
-        slot.stalled = true;
-        console.error("Lottie: could not advance an animation", error);
-      }
+      if (slot.visible) this.applyFrame(slot);
     }
 
-    const onScreen = this.slots.filter((slot) => slot.visible);
-    if (!onScreen.length && !this.queue.length) {
+    const scene = this.slots.filter((slot) => slot.inScene);
+    if (!scene.length && !this.queue.length) {
       this.stop();
       return;
     }
 
     try {
-      this.paint(onScreen);
+      this.paint(scene);
+      // A paused slot was in the scene only for this frame.
+      for (const slot of scene) {
+        slot.dirty = false;
+        this.sync(slot);
+      }
     } catch (error) {
       console.error("Lottie: frame failed", error);
       this.stop();
@@ -726,9 +806,9 @@ class AtlasPlayer extends Player {
     this.canvas.resize(ATLAS_MIN, ATLAS_MIN);
   }
 
-  protected paint(onScreen: Slot[]): void {
+  protected paint(scene: Slot[]): void {
     this.canvas.update().render();
-    for (const slot of onScreen) {
+    for (const slot of scene) {
       const { width, height } = slot.targetEl;
       slot.target?.clearRect(0, 0, width, height);
       slot.target?.drawImage(
@@ -855,8 +935,8 @@ class DirectPlayer extends Player {
     slot.canvas = null;
   }
 
-  protected paint(onScreen: Slot[]): void {
-    for (const slot of onScreen) slot.canvas?.update().render();
+  protected paint(scene: Slot[]): void {
+    for (const slot of scene) slot.canvas?.update().render();
   }
 }
 
@@ -876,10 +956,57 @@ function describeCanvas(el: HTMLCanvasElement, name: string | null): void {
   }
 }
 
-function createCanvas(parent: HTMLElement, name: string | null): HTMLCanvasElement {
-  const el = parent.createEl("canvas");
-  describeCanvas(el, name);
-  return el;
+/**
+ * The canvas an animation is shown on, and the button that pauses it, in a box
+ * of the canvas's size so the button can sit over it. The pause is kept here
+ * and not on the slot, because the player can take a slot back to make room
+ * and a new one takes its place.
+ *
+ * WCAG 2.2.2 asks for this: motion that starts by itself and lasts more than
+ * five seconds needs a way to pause it. The button's label says what it will
+ * do, as gifa11y's does, and names the animation when it has a name.
+ */
+class Stage {
+  readonly canvasEl: HTMLCanvasElement;
+  private el: HTMLElement;
+  private buttonEl: HTMLButtonElement;
+  private name: string | null = null;
+
+  constructor(
+    parent: HTMLElement,
+    name: string | null,
+    private slot: () => Slot | null,
+    public paused = false,
+  ) {
+    this.el = parent.createSpan({ cls: "lottie-thorvg-stage" });
+    this.canvasEl = this.el.createEl("canvas");
+    this.buttonEl = this.el.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
+    this.buttonEl.addEventListener("click", () => {
+      this.paused = !this.paused;
+      this.update();
+      this.apply(this.slot());
+    });
+    this.describe(name);
+  }
+
+  describe(name: string | null): void {
+    this.name = name;
+    describeCanvas(this.canvasEl, name);
+    this.update();
+  }
+
+  /** Carries the pause over to a slot, which may be one just given. */
+  apply(slot: Slot | null): void {
+    if (this.paused) slot?.pause();
+    else slot?.play();
+  }
+
+  private update(): void {
+    const action = this.paused ? "Play animation" : "Pause animation";
+    this.buttonEl.setAttribute("aria-label", this.name ? `${action}: ${this.name}` : action);
+    setIcon(this.buttonEl, this.paused ? "play" : "pause");
+    this.el.toggleAttribute("data-paused", this.paused);
+  }
 }
 
 /**
@@ -908,7 +1035,7 @@ interface Reading {
  * share everything else.
  */
 abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
-  private canvasEl: HTMLCanvasElement | null = null;
+  private stage: Stage | null = null;
   private slot: Slot | null = null;
   /** The animation's own dimensions, before any alias size is applied. */
   private nativeSize: Size | null = null;
@@ -1044,7 +1171,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
 
     const { drawWidth, drawHeight } = this.drawSize(native.width, native.height);
     const ratio = pixelRatio();
-    const el = this.ensureCanvas();
+    const el = this.ensureStage().canvasEl;
 
     el.width = Math.max(1, Math.round(drawWidth * ratio));
     el.height = Math.max(1, Math.round(drawHeight * ratio));
@@ -1057,13 +1184,13 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     const alignment = requestedAlignment(this.containerEl);
     if (alignment) this.containerEl.dataset.align = alignment;
     else delete this.containerEl.dataset.align;
-    if (this.canvasEl) describeCanvas(this.canvasEl, accessibleName(this.containerEl));
+    this.stage?.describe(accessibleName(this.containerEl));
     this.place();
   }
 
-  private ensureCanvas(): HTMLCanvasElement {
-    this.canvasEl ??= createCanvas(this.containerEl, accessibleName(this.containerEl));
-    return this.canvasEl;
+  private ensureStage(): Stage {
+    this.stage ??= new Stage(this.containerEl, accessibleName(this.containerEl), () => this.slot);
+    return this.stage;
   }
 
   /** Asks the player for a slot, which loads the animation to fill it. */
@@ -1088,9 +1215,10 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
 
       // A Lottie that never said how large it is has had no canvas to lay out
       // with. It gets one at whatever size, and ThorVG's answer sizes it after.
+      const stage = this.ensureStage();
       const slot = await player.acquire(
         json,
-        this.ensureCanvas(),
+        stage.canvasEl,
         () => this.onScreen && !this.tornDown,
       );
       if (!slot) return;
@@ -1099,11 +1227,15 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
         return;
       }
 
+      // The player took the last slot back to make room. This one carries on
+      // from the frame that one was at.
+      if (this.slot?.released) slot.seek(this.slot.frame);
       this.slot = slot;
       if (!this.nativeSize?.width) {
         this.nativeSize = slot.native;
         this.place();
       }
+      stage.apply(slot);
       if (this.onScreen) slot.show();
     } catch (error) {
       this.fail(error);
@@ -1143,7 +1275,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     this.detach();
     this.observer?.disconnect();
     this.containerEl.empty();
-    this.canvasEl = null;
+    this.stage = null;
     this.fillNotLottie(this.containerEl);
   }
 
@@ -1151,7 +1283,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     console.error("Lottie:", error);
     this.detach();
     this.containerEl.empty();
-    this.canvasEl = null;
+    this.stage = null;
     this.containerEl.createDiv({
       cls: "lottie-thorvg-error",
       text: `Could not render ${this.name}`,
@@ -1241,7 +1373,7 @@ const VIEW_TYPE = "lottie";
  * the behaviour it had before.
  */
 class LottieView extends FileView implements LottieSurface {
-  private canvasEl: HTMLCanvasElement | null = null;
+  private stage: Stage | null = null;
   private slot: Slot | null = null;
   private nativeSize: Size | null = null;
   private visibility: IntersectionObserver | null = null;
@@ -1308,7 +1440,7 @@ class LottieView extends FileView implements LottieSurface {
   async redraw(): Promise<void> {
     // Already reloading — see LottieEmbed.redraw() for why this is skipped.
     if (this.attaching) return;
-    if (this.file) await this.show(this.file);
+    if (this.file) await this.show(this.file, this.stage?.paused);
   }
 
   // The animation is drawn at the size it is shown at, so a resized pane needs
@@ -1317,11 +1449,12 @@ class LottieView extends FileView implements LottieSurface {
     this.fit();
   }
 
-  private async show(file: TFile): Promise<void> {
+  /** `paused` carries a pause over when the same file is shown again. */
+  private async show(file: TFile, paused = false): Promise<void> {
     this.detach();
     const content = this.contentEl;
     content.empty();
-    this.canvasEl = null;
+    this.stage = null;
     content.addClass("lottie-thorvg-view");
 
     const size = await this.plugin.index.ensure(file);
@@ -1332,14 +1465,14 @@ class LottieView extends FileView implements LottieSurface {
     }
 
     this.nativeSize = size.width > 0 ? size : null;
-    this.canvasEl = createCanvas(content, file.name);
+    this.stage = new Stage(content, file.name, () => this.slot, paused);
     this.fit();
     await this.attach();
   }
 
   private async attach(): Promise<void> {
     const file = this.file;
-    if (this.attaching || !file || !this.canvasEl || !this.onScreen) return;
+    if (this.attaching || !file || !this.stage || !this.onScreen) return;
     this.attaching = true;
     try {
       const json = await this.app.vault.cachedRead(file);
@@ -1348,17 +1481,18 @@ class LottieView extends FileView implements LottieSurface {
       if (!size) {
         this.detach();
         this.contentEl.empty();
-        this.canvasEl = null;
+        this.stage = null;
         this.showNotAnimation(file);
         return;
       }
 
       const player = await this.plugin.ensurePlayer();
-      if (this.file !== file || !this.onScreen || !this.canvasEl) return;
+      const stage = this.stage;
+      if (this.file !== file || !this.onScreen || !stage) return;
 
       const slot = await player.acquire(
         json,
-        this.canvasEl,
+        stage.canvasEl,
         () => this.file === file && this.onScreen,
       );
       if (!slot) return;
@@ -1367,16 +1501,19 @@ class LottieView extends FileView implements LottieSurface {
         return;
       }
 
+      // See LottieEmbed.attach().
+      if (this.slot?.released) slot.seek(this.slot.frame);
       this.slot = slot;
       if (!this.nativeSize) {
         this.nativeSize = slot.native;
         this.fit();
       }
+      stage.apply(slot);
       if (this.onScreen) slot.show();
     } catch (error) {
       console.error("Lottie:", error);
       this.contentEl.empty();
-      this.canvasEl = null;
+      this.stage = null;
       this.contentEl.createDiv({
         cls: "lottie-thorvg-error",
         text: `Could not render ${file.name}`,
@@ -1393,7 +1530,8 @@ class LottieView extends FileView implements LottieSurface {
 
   /** Scales the animation to fill the pane, keeping its proportions. */
   private fit(): void {
-    const { nativeSize, canvasEl } = this;
+    const { nativeSize } = this;
+    const canvasEl = this.stage?.canvasEl;
     if (!nativeSize || !canvasEl) return;
 
     const pane = this.contentEl.getBoundingClientRect();
