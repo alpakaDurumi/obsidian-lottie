@@ -999,16 +999,16 @@ function describeToggle(els: LottieElements, paused: boolean, name: string | nul
 }
 
 /**
- * An embed inside a note, or the view a `.json` opens in. The plugin tracks
- * these so it can free them before tearing the engine down, and reload them
- * when the file changes.
+ * What the plugin calls on an animation it is holding. A note embed extends
+ * MarkdownRenderChild and a tab extends FileView, so the two have no common
+ * ancestor to name here.
  */
-interface LottieSurface {
-  /** Null for a code block, which has no file, and for a view between files. */
+interface Playable {
+  /** Null for a code block, which has no file. */
   readonly file: TFile | null;
-  /** Gives up the animation's slot, leaving the surface able to take another. */
+  /** Gives up the animation's slot, leaving it able to take another. */
   release(): void;
-  /** Re-reads the file and shows it again. */
+  /** Re-reads the source and shows it again. */
   redraw(): Promise<void>;
   /** Stops or plays the animation, as the autoplay setting is switched. */
   setPaused(paused: boolean): void;
@@ -1020,248 +1020,383 @@ interface Reading {
   size: Size | null;
 }
 
+/** Reads an animation out of the vault, telling the index what it found. */
+async function readAnimation(plugin: LottiePlugin, file: TFile): Promise<Reading> {
+  const json = await plugin.app.vault.cachedRead(file);
+  const size = lottieSize(json);
+  plugin.index.remember(file, size);
+  return { json, size };
+}
+
 /**
- * An animation shown inline in a note. The kinds of embed differ in where the
- * JSON comes from and in what is shown when it is not a Lottie document, and
- * share everything else.
+ * Any class the mixin below can be laid over. The rest parameter is what
+ * TypeScript's own mixin pattern asks for: the base's real constructor
+ * signature is kept, because T is inferred as the class that is passed in.
  */
-abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
-  private elements: LottieElements | null = null;
-  private slot: Slot | null = null;
-  /** Paused by the viewer or by the autoplay setting. Outlives any one slot. */
-  private paused: boolean;
-  /** The animation's own dimensions, before any alias size is applied. */
-  private nativeSize: Size | null = null;
-  private observer: IntersectionObserver | null = null;
+type Constructor<T> = abstract new (...args: any[]) => T;
+
+/**
+ * Everything one animation on screen needs: the canvas and its button, the
+ * slot drawn into it, and whether it is in view.
+ *
+ * A function and not a base class because a note embed must extend
+ * MarkdownRenderChild and a tab must extend FileView, and a class can extend
+ * only one. Both extend this instead, so what follows is written once.
+ */
+function withAnimation<T extends Constructor<Component>>(Base: T) {
+  abstract class Animated extends Base {
+    abstract readonly file: TFile | null;
+
+    private elements: LottieElements | null = null;
+    private slot: Slot | null = null;
+    /** Paused by the viewer or by the autoplay setting. Outlives any one slot. */
+    private paused = false;
+    /** The animation's own dimensions, before any requested size is applied. */
+    private nativeSize: Size | null = null;
+    private observer: IntersectionObserver | null = null;
+    private onScreen = false;
+    private attaching = false;
+    private mounted = false;
+    /** rootEl holds a notice or an error message instead of the animation. */
+    private replaced = false;
+    /**
+     * Counts mounts and unmounts. A tab is mounted again for each file it is
+     * given, so a boolean cannot tell work left over from the file before
+     * apart from work belonging to this one. Every await reads this back.
+     */
+    private generation = 0;
+
+    protected abstract readonly plugin: LottiePlugin;
+    /** Where the canvas and its button are built. */
+    protected abstract readonly rootEl: HTMLElement;
+    /** What the animation is called in an error message. */
+    protected abstract readonly label: string;
+
+    /** The size from the cheapest place there is, to lay out with before drawing. */
+    protected abstract measure(): Promise<Size | null>;
+    /** Reads the animation afresh. */
+    protected abstract read(): Promise<Reading>;
+    /** Fills rootEl in place of an animation, for a source that is not one. */
+    protected abstract fillNotLottie(el: HTMLElement): void;
+    /** The size to draw at, or null while that cannot be worked out yet. */
+    protected abstract drawSize(
+      width: number,
+      height: number,
+    ): { drawWidth: number; drawHeight: number } | null;
+    /** The text assistive technology is given, or null for decoration. */
+    protected abstract describeAs(): string | null;
+    /** Watches whatever else the size or the name is read from. */
+    protected observeSource(): void {}
+    /** Drops what observeSource() set up. */
+    protected unobserveSource(): void {}
+
+    /**
+     * Draws the animation and starts following it on and off screen. A tab
+     * calls this again for each file it is given, so nothing here assumes it
+     * runs once.
+     */
+    protected async mount(): Promise<void> {
+      this.unmount();
+      const mount = ++this.generation;
+      this.mounted = true;
+      this.paused = this.plugin.startPaused();
+      this.replaced = false;
+      this.nativeSize = null;
+      this.onScreen = false;
+      this.plugin.playables.add(this);
+      this.rootEl.empty();
+      this.elements = null;
+      this.rootEl.addClass("lottie-thorvg");
+      this.rootEl.dataset.renderer = this.plugin.settings.renderer;
+
+      // Take the space before anything is drawn. Everything below turns on
+      // whether the animation is on screen, and one that has not drawn has no
+      // position worth asking about. Nor can its neighbours have one while it
+      // sits between them with no size.
+      const size = await this.measure();
+      if (this.generation !== mount) return;
+      if (!size) {
+        this.showNotLottie();
+        return;
+      }
+      this.nativeSize = size;
+      this.refresh();
+
+      this.observer = new IntersectionObserver(
+        (entries) => {
+          this.onScreen = entries.some((entry) => entry.isIntersecting);
+          if (!this.onScreen) {
+            this.slot?.hide();
+            return;
+          }
+          // The slot outlives scrolling, so this is usually free. It is gone
+          // only if the player had to take it back to make room.
+          if (this.slot && !this.slot.released) this.slot.show();
+          else void this.attach();
+        },
+        // Slack either side, so an animation just past the edge keeps playing
+        // rather than stopping and starting as the note is scrolled.
+        { rootMargin: `${NEAR_SCREEN}px` },
+      );
+      this.observer.observe(this.rootEl);
+      this.observeSource();
+    }
+
+    /** Gives everything up. A later mount() draws again from nothing. */
+    protected unmount(): void {
+      if (!this.mounted) return;
+      this.mounted = false;
+      this.generation++;
+      // Whatever attach() was waiting on is now the previous mount's, and its
+      // own generation check will drop it. This lets the next one start.
+      this.attaching = false;
+      this.observer?.disconnect();
+      this.observer = null;
+      this.unobserveSource();
+      this.plugin.playables.delete(this);
+      this.release();
+    }
+
+    onunload(): void {
+      this.unmount();
+      super.onunload();
+    }
+
+    /** Puts the name and the size back in step with what they are read from. */
+    refresh(): void {
+      this.describe();
+      this.place();
+    }
+
+    release(): void {
+      this.detach();
+    }
+
+    /**
+     * Reloads after the source changed, the way Obsidian's own embeds do. Text
+     * that is not JSON at all is left alone rather than replacing a working
+     * animation, since an editor saving over the file can be caught mid-write.
+     * JSON that is simply no longer an animation is a real change.
+     */
+    async redraw(): Promise<void> {
+      // Already reloading. A redraw asked for while attach() is in flight
+      // would only redo its read and parse, then find attach()'s guard and stop.
+      if (!this.mounted || this.attaching) return;
+      // showNotLottie() and fail() took the elements and the observer with
+      // them, so a source that is an animation again is built from nothing.
+      if (this.replaced) {
+        await this.mount();
+        return;
+      }
+      const mount = this.generation;
+      try {
+        const { size } = await this.read();
+        if (this.generation !== mount) return;
+        if (!size) {
+          this.detach();
+          this.showNotLottie();
+          return;
+        }
+        if (size.width > 0) {
+          this.nativeSize = size;
+          this.place();
+        }
+        this.detach();
+        if (this.onScreen) await this.attach();
+      } catch (error) {
+        this.fail(error);
+      }
+    }
+
+    setPaused(paused: boolean): void {
+      if (paused === this.paused) return;
+      this.paused = paused;
+      this.describe();
+      this.applyPause();
+    }
+
+    /** Puts the pause into effect on whatever slot is held. */
+    private applyPause(): void {
+      if (this.paused) this.slot?.pause();
+      else this.slot?.play();
+    }
+
+    /** Names the animation on its canvas and on its button. */
+    private describe(): void {
+      if (!this.elements) return;
+      const name = this.describeAs();
+      describeCanvas(this.elements.canvasEl, name);
+      describeToggle(this.elements, this.paused, name);
+    }
+
+    private ensureElements(): LottieElements {
+      if (!this.elements) {
+        this.elements = createLottieElements(this.rootEl, () => this.setPaused(!this.paused));
+        this.describe();
+      }
+      return this.elements;
+    }
+
+    /**
+     * Sizes the canvas the animation is painted into. Called before anything is
+     * drawn, so the layout is set as it will be, and again whenever what the
+     * size is read from says something different.
+     */
+    private place(): void {
+      const native = this.nativeSize;
+      if (!native || native.width <= 0 || native.height <= 0 || !this.mounted) return;
+
+      const drawn = this.drawSize(native.width, native.height);
+      if (!drawn) return;
+      const ratio = pixelRatio();
+      const el = this.ensureElements().canvasEl;
+
+      el.width = Math.max(1, Math.round(drawn.drawWidth * ratio));
+      el.height = Math.max(1, Math.round(drawn.drawHeight * ratio));
+      el.style.width = `${drawn.drawWidth}px`;
+      el.style.height = `${drawn.drawHeight}px`;
+      this.slot?.resize(el.width, el.height);
+    }
+
+    /** Asks the player for a slot, which loads the animation to fill it. */
+    private async attach(): Promise<void> {
+      if (this.attaching || !this.mounted) return;
+      const mount = this.generation;
+      this.attaching = true;
+      try {
+        const { json, size } = await this.read();
+        if (this.generation !== mount) return;
+        if (!size) {
+          this.showNotLottie();
+          return;
+        }
+        // A source with no size of its own could not be laid out until now.
+        if (size.width > 0 && !this.nativeSize?.width) {
+          this.nativeSize = size;
+          this.place();
+        }
+
+        const player = await this.plugin.ensurePlayer();
+        // The awaits above give the note time to close, or to scroll away.
+        if (this.generation !== mount || !this.onScreen) return;
+
+        // A Lottie that never said how large it is has had no canvas to lay out
+        // with. It gets one at whatever size, and ThorVG's answer sizes it after.
+        const els = this.ensureElements();
+        const slot = await player.acquire(
+          json,
+          els.canvasEl,
+          () => this.onScreen && this.generation === mount,
+        );
+        if (!slot) return;
+        if (this.generation !== mount) {
+          slot.release();
+          return;
+        }
+
+        // The player took the last slot back to make room. This one carries on
+        // from the frame that one was at.
+        if (this.slot?.released) slot.seek(this.slot.frame);
+        this.slot = slot;
+        if (!this.nativeSize?.width) {
+          this.nativeSize = slot.native;
+          this.place();
+        }
+        this.applyPause();
+        if (this.onScreen) slot.show();
+      } catch (error) {
+        this.fail(error);
+      } finally {
+        if (this.generation === mount) this.attaching = false;
+      }
+    }
+
+    /** Gives the animation up. The canvas keeps its last frame. */
+    private detach(): void {
+      this.slot?.release();
+      this.slot = null;
+    }
+
+    private showNotLottie(): void {
+      this.replaced = true;
+      this.detach();
+      this.observer?.disconnect();
+      this.observer = null;
+      this.rootEl.empty();
+      this.elements = null;
+      this.fillNotLottie(this.rootEl);
+    }
+
+    private fail(error: unknown): void {
+      console.error("Lottie:", error);
+      this.replaced = true;
+      this.detach();
+      this.rootEl.empty();
+      this.elements = null;
+      this.rootEl.createDiv({
+        cls: "lottie-thorvg-error",
+        text: `Could not render ${this.label}`,
+      });
+    }
+  }
+
+  return Animated;
+}
+
+/**
+ * An animation shown inline in a note. Subclasses differ in where the JSON
+ * comes from and in what is shown when it is not a Lottie document.
+ */
+abstract class LottieEmbed extends withAnimation(MarkdownRenderChild) implements Playable {
   private aliasObserver: MutationObserver | null = null;
-  private onScreen = false;
-  private attaching = false;
-  private tornDown = false;
 
   abstract readonly file: TFile | null;
-  /** What the embed is called in an error message. */
-  protected abstract readonly name: string;
 
   constructor(
     containerEl: HTMLElement,
-    protected plugin: LottiePlugin,
+    protected readonly plugin: LottiePlugin,
   ) {
     super(containerEl);
-    this.paused = plugin.startPaused();
   }
 
-  /** The size from the cheapest place there is, so the note can be laid out first. */
-  protected abstract measure(): Promise<Size | null>;
-  /** Reads the animation afresh. */
-  protected abstract read(): Promise<Reading>;
-  /** Fills the container in place of an animation, for a source that is not one. */
-  protected abstract fillNotLottie(el: HTMLElement): void;
+  protected get rootEl(): HTMLElement {
+    return this.containerEl;
+  }
 
-  // Called by Obsidian's embed loader, or by the code block processor, once
-  // the component is attached.
-  async loadFile(): Promise<void> {
-    this.plugin.surfaces.add(this);
-    this.containerEl.empty();
-    this.containerEl.addClass("lottie-thorvg");
-    this.containerEl.dataset.renderer = this.plugin.settings.renderer;
+  /** The name Obsidian's embed loader and the code block processor call. */
+  loadFile(): Promise<void> {
+    return this.mount();
+  }
 
-    // Take the space before anything is drawn. Everything below turns on
-    // whether the embed is on screen, and an embed that has not drawn has no
-    // position worth asking about — nor can its neighbours have one while it
-    // sits between them with no size.
-    const size = await this.measure();
-    if (this.tornDown) return;
-    if (!size) {
-      this.showNotLottie();
-      return;
-    }
-    this.nativeSize = size;
-    this.applyAlias();
-
-    this.observer = new IntersectionObserver(
-      (entries) => {
-        this.onScreen = entries.some((entry) => entry.isIntersecting);
-        if (!this.onScreen) {
-          this.slot?.hide();
-          return;
-        }
-        // The slot outlives scrolling, so this is usually free. It is gone only
-        // if the player had to take it back to make room for something else.
-        if (this.slot && !this.slot.released) this.slot.show();
-        else void this.attach();
-      },
-      // Slack either side, so an animation just past the edge keeps playing
-      // rather than stopping and starting as the note is scrolled.
-      { rootMargin: `${NEAR_SCREEN}px` },
-    );
-    this.observer.observe(this.containerEl);
-
-    // Editing the alias in Live Preview does not rebuild the widget: Obsidian
-    // reuses the DOM and just rewrites these attributes. For an image it also
-    // re-applies them to the <img>, but nothing tells a foreign child, so the
-    // change has to be picked up from the container itself.
-    this.aliasObserver = new MutationObserver(() => this.applyAlias());
+  /**
+   * Editing the alias in Live Preview does not rebuild the widget: Obsidian
+   * reuses the DOM and just rewrites these attributes. For an image it also
+   * re-applies them to the img element, but nothing tells a foreign child, so
+   * the change has to be picked up from the container itself.
+   */
+  protected observeSource(): void {
+    this.aliasObserver = new MutationObserver(() => this.refresh());
     this.aliasObserver.observe(this.containerEl, {
       attributes: true,
       attributeFilter: ["width", "height", "alt"],
     });
   }
 
-  onunload(): void {
-    this.plugin.surfaces.delete(this);
-    this.teardown();
-  }
-
-  /** Retires the embed permanently; it will not draw again. */
-  teardown(): void {
-    if (this.tornDown) return;
-    this.tornDown = true;
-    this.observer?.disconnect();
+  protected unobserveSource(): void {
     this.aliasObserver?.disconnect();
-    this.release();
+    this.aliasObserver = null;
   }
 
-  release(): void {
-    this.detach();
-  }
-
-  /**
-   * Reloads after the file changed on disk, the way Obsidian's own embeds do.
-   * Text that is not JSON at all is left alone rather than replacing a working
-   * animation, since an editor saving over the file can be caught mid-write;
-   * JSON that is simply no longer an animation is a real change and gets the
-   * file card.
-   */
-  async redraw(): Promise<void> {
-    // Already reloading — a redraw asked for while attach() is in flight would
-    // only redo its read and parse, then find attach()'s own guard and stop.
-    if (this.tornDown || this.attaching) return;
-    try {
-      const { size } = await this.read();
-      if (!size) {
-        this.detach();
-        this.showNotLottie();
-        return;
-      }
-      if (size.width > 0) {
-        this.nativeSize = size;
-        this.place();
-      }
-      this.detach();
-      if (this.onScreen) await this.attach();
-    } catch (error) {
-      this.fail(error);
-    }
-  }
-
-  /**
-   * Sizes the canvas the animation is painted into. Called before anything is
-   * drawn, so the note is laid out as it will be, and again whenever the alias
-   * or the animation's own size says something different.
-   */
-  private place(): void {
-    const native = this.nativeSize;
-    if (!native || native.width <= 0 || native.height <= 0 || this.tornDown) return;
-
-    const { drawWidth, drawHeight } = this.drawSize(native.width, native.height);
-    const ratio = pixelRatio();
-    const el = this.ensureElements().canvasEl;
-
-    el.width = Math.max(1, Math.round(drawWidth * ratio));
-    el.height = Math.max(1, Math.round(drawHeight * ratio));
-    el.style.width = `${drawWidth}px`;
-    el.style.height = `${drawHeight}px`;
-    this.slot?.resize(el.width, el.height);
-  }
-
-  private applyAlias(): void {
+  /** The alignment is the one part of the alias that is neither size nor name. */
+  refresh(): void {
     const alignment = requestedAlignment(this.containerEl);
     if (alignment) this.containerEl.dataset.align = alignment;
     else delete this.containerEl.dataset.align;
-    this.describe();
-    this.place();
+    super.refresh();
   }
 
-  private ensureElements(): LottieElements {
-    if (!this.elements) {
-      this.elements = createLottieElements(this.containerEl, () => this.setPaused(!this.paused));
-      this.describe();
-    }
-    return this.elements;
-  }
-
-  /** Names the animation on its canvas and on its button. */
-  private describe(): void {
-    if (!this.elements) return;
-    const name = accessibleName(this.containerEl);
-    describeCanvas(this.elements.canvasEl, name);
-    describeToggle(this.elements, this.paused, name);
-  }
-
-  setPaused(paused: boolean): void {
-    if (paused === this.paused) return;
-    this.paused = paused;
-    this.describe();
-    this.applyPause();
-  }
-
-  /** Puts the pause into effect on whatever slot the embed holds. */
-  private applyPause(): void {
-    if (this.paused) this.slot?.pause();
-    else this.slot?.play();
-  }
-
-  /** Asks the player for a slot, which loads the animation to fill it. */
-  private async attach(): Promise<void> {
-    if (this.attaching || this.tornDown) return;
-    this.attaching = true;
-    try {
-      const { json, size } = await this.read();
-      if (!size) {
-        this.showNotLottie();
-        return;
-      }
-      // A file with no size of its own could not be laid out until now.
-      if (size.width > 0 && !this.nativeSize?.width) {
-        this.nativeSize = size;
-        this.place();
-      }
-
-      const player = await this.plugin.ensurePlayer();
-      // The awaits above give the note time to close, or to scroll away.
-      if (this.tornDown || !this.onScreen) return;
-
-      // A Lottie that never said how large it is has had no canvas to lay out
-      // with. It gets one at whatever size, and ThorVG's answer sizes it after.
-      const els = this.ensureElements();
-      const slot = await player.acquire(json, els.canvasEl, () => this.onScreen && !this.tornDown);
-      if (!slot) return;
-      if (this.tornDown) {
-        slot.release();
-        return;
-      }
-
-      // The player took the last slot back to make room. This one carries on
-      // from the frame that one was at.
-      if (this.slot?.released) slot.seek(this.slot.frame);
-      this.slot = slot;
-      if (!this.nativeSize?.width) {
-        this.nativeSize = slot.native;
-        this.place();
-      }
-      this.applyPause();
-      if (this.onScreen) slot.show();
-    } catch (error) {
-      this.fail(error);
-    } finally {
-      this.attaching = false;
-    }
-  }
-
-  /** Gives the animation up permanently. The canvas keeps its last frame. */
-  private detach(): void {
-    this.slot?.release();
-    this.slot = null;
+  protected describeAs(): string | null {
+    return accessibleName(this.containerEl);
   }
 
   /**
@@ -1271,7 +1406,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
    * dimensions. Obsidian's parser cannot produce a height without a width, so
    * that case does not arise.
    */
-  private drawSize(width: number, height: number): { drawWidth: number; drawHeight: number } {
+  protected drawSize(width: number, height: number): { drawWidth: number; drawHeight: number } {
     const asked = requestedSize(this.containerEl);
     if (asked.width && asked.height) {
       return { drawWidth: asked.width, drawHeight: asked.height };
@@ -1283,25 +1418,6 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
       };
     }
     return { drawWidth: Math.round(width), drawHeight: Math.round(height) };
-  }
-
-  private showNotLottie(): void {
-    this.detach();
-    this.observer?.disconnect();
-    this.containerEl.empty();
-    this.elements = null;
-    this.fillNotLottie(this.containerEl);
-  }
-
-  private fail(error: unknown): void {
-    console.error("Lottie:", error);
-    this.detach();
-    this.containerEl.empty();
-    this.elements = null;
-    this.containerEl.createDiv({
-      cls: "lottie-thorvg-error",
-      text: `Could not render ${this.name}`,
-    });
   }
 }
 
@@ -1315,7 +1431,7 @@ class FileEmbed extends LottieEmbed {
     super(containerEl, plugin);
   }
 
-  protected get name(): string {
+  protected get label(): string {
     return this.file.name;
   }
 
@@ -1323,11 +1439,8 @@ class FileEmbed extends LottieEmbed {
     return this.plugin.index.ensure(this.file);
   }
 
-  protected async read(): Promise<Reading> {
-    const json = await this.plugin.app.vault.cachedRead(this.file);
-    const size = lottieSize(json);
-    this.plugin.index.remember(this.file, size);
-    return { json, size };
+  protected read(): Promise<Reading> {
+    return readAnimation(this.plugin, this.file);
   }
 
   /**
@@ -1349,7 +1462,7 @@ class FileEmbed extends LottieEmbed {
 /** A `lottie` code block, whose animation is the text of the block itself. */
 class BlockEmbed extends LottieEmbed {
   readonly file = null;
-  protected readonly name = "lottie code block";
+  protected readonly label = "lottie code block";
   private readonly size: Size | null;
 
   constructor(
@@ -1383,48 +1496,26 @@ const VIEW_TYPE = "lottie";
  * Lottie file in the explorer ends up in a text editor.
  *
  * Registration is per extension, so this claims every `.json`. One that is not
- * an animation gets a note saying so and a way to open it outside Obsidian —
- * the behaviour it had before.
+ * an animation gets a note saying so and a way to open it outside Obsidian,
+ * which is the behaviour it had before.
  */
-class LottieView extends FileView implements LottieSurface {
-  private elements: LottieElements | null = null;
-  private slot: Slot | null = null;
-  /** Paused by the viewer or by the autoplay setting. Outlives any one slot. */
-  private paused = false;
-  private nativeSize: Size | null = null;
-  private visibility: IntersectionObserver | null = null;
-  private attaching = false;
-  /** Whether the pane is on screen; a background tab must not burn frames. */
-  private onScreen = true;
+class LottieView extends withAnimation(FileView) implements Playable {
+  /** FileView already keeps this; the declaration only names it for Animated. */
+  declare readonly file: TFile | null;
 
   constructor(
     leaf: WorkspaceLeaf,
-    private plugin: LottiePlugin,
+    protected readonly plugin: LottiePlugin,
   ) {
     super(leaf);
   }
 
-  protected async onOpen(): Promise<void> {
-    // A tab that is not in front has no layout, so this covers both the
-    // background-tab case and a pane split off to the side, which stays on
-    // screen and keeps playing.
-    this.visibility = new IntersectionObserver((entries) => {
-      this.onScreen = entries.some((entry) => entry.isIntersecting);
-      if (!this.onScreen) {
-        this.slot?.hide();
-        return;
-      }
-      if (this.slot && !this.slot.released) this.slot.show();
-      else void this.attach();
-    });
-    this.visibility.observe(this.contentEl);
+  protected get rootEl(): HTMLElement {
+    return this.contentEl;
   }
 
-  protected async onClose(): Promise<void> {
-    this.visibility?.disconnect();
-    this.visibility = null;
-    this.plugin.surfaces.delete(this);
-    this.release();
+  protected get label(): string {
+    return this.file?.name ?? "the animation";
   }
 
   getViewType(): string {
@@ -1439,167 +1530,59 @@ class LottieView extends FileView implements LottieSurface {
     return this.file?.basename ?? "Lottie";
   }
 
-  async onLoadFile(file: TFile): Promise<void> {
-    this.plugin.surfaces.add(this);
-    await this.show(file);
+  async onLoadFile(): Promise<void> {
+    this.contentEl.addClass("lottie-thorvg-view");
+    await this.mount();
   }
 
-  async onUnloadFile(): Promise<void> {
-    this.plugin.surfaces.delete(this);
-    this.release();
-  }
-
-  release(): void {
-    this.detach();
-  }
-
-  setPaused(paused: boolean): void {
-    if (paused === this.paused) return;
-    this.paused = paused;
-    this.describe();
-    this.applyPause();
-  }
-
-  /** Puts the pause into effect on whatever slot the view holds. */
-  private applyPause(): void {
-    if (this.paused) this.slot?.pause();
-    else this.slot?.play();
-  }
-
-  /** Names the animation on its canvas and on its button. */
-  private describe(): void {
-    if (!this.elements) return;
-    const name = this.file?.name ?? null;
-    describeCanvas(this.elements.canvasEl, name);
-    describeToggle(this.elements, this.paused, name);
-  }
-
-  async redraw(): Promise<void> {
-    // Already reloading — see LottieEmbed.redraw() for why this is skipped.
-    if (this.attaching) return;
-    if (this.file) await this.show(this.file, this.paused);
+  onUnloadFile(): Promise<void> {
+    this.unmount();
+    return Promise.resolve();
   }
 
   // The animation is drawn at the size it is shown at, so a resized pane needs
   // it drawn again rather than scaled.
   onResize(): void {
-    this.fit();
+    this.refresh();
   }
 
-  /** `paused` carries a pause over when the same file is shown again. */
-  private async show(file: TFile, paused = this.plugin.startPaused()): Promise<void> {
-    this.detach();
-    const content = this.contentEl;
-    content.empty();
-    this.elements = null;
-    this.paused = paused;
-    content.addClass("lottie-thorvg-view");
-
-    const size = await this.plugin.index.ensure(file);
-    if (this.file !== file) return;
-    if (!size) {
-      this.showNotAnimation(file);
-      return;
-    }
-
-    this.nativeSize = size.width > 0 ? size : null;
-    this.elements = createLottieElements(content, () => this.setPaused(!this.paused));
-    this.describe();
-    this.fit();
-    await this.attach();
+  protected describeAs(): string | null {
+    return this.file?.name ?? null;
   }
 
-  private async attach(): Promise<void> {
-    const file = this.file;
-    if (this.attaching || !file || !this.elements || !this.onScreen) return;
-    this.attaching = true;
-    try {
-      const json = await this.app.vault.cachedRead(file);
-      const size = lottieSize(json);
-      this.plugin.index.remember(file, size);
-      if (!size) {
-        this.detach();
-        this.contentEl.empty();
-        this.elements = null;
-        this.showNotAnimation(file);
-        return;
-      }
-
-      const player = await this.plugin.ensurePlayer();
-      const els = this.elements;
-      if (this.file !== file || !this.onScreen || !els) return;
-
-      const slot = await player.acquire(
-        json,
-        els.canvasEl,
-        () => this.file === file && this.onScreen,
-      );
-      if (!slot) return;
-      if (this.file !== file) {
-        slot.release();
-        return;
-      }
-
-      // See LottieEmbed.attach().
-      if (this.slot?.released) slot.seek(this.slot.frame);
-      this.slot = slot;
-      if (!this.nativeSize) {
-        this.nativeSize = slot.native;
-        this.fit();
-      }
-      this.applyPause();
-      if (this.onScreen) slot.show();
-    } catch (error) {
-      console.error("Lottie:", error);
-      this.contentEl.empty();
-      this.elements = null;
-      this.contentEl.createDiv({
-        cls: "lottie-thorvg-error",
-        text: `Could not render ${file.name}`,
-      });
-    } finally {
-      this.attaching = false;
-    }
+  protected measure(): Promise<Size | null> {
+    return this.file ? this.plugin.index.ensure(this.file) : Promise.resolve(null);
   }
 
-  private detach(): void {
-    this.slot?.release();
-    this.slot = null;
+  protected read(): Promise<Reading> {
+    if (!this.file) return Promise.resolve({ json: "", size: null });
+    return readAnimation(this.plugin, this.file);
   }
 
   /** Scales the animation to fill the pane, keeping its proportions. */
-  private fit(): void {
-    const { nativeSize } = this;
-    const canvasEl = this.elements?.canvasEl;
-    if (!nativeSize || !canvasEl) return;
-
+  protected drawSize(
+    width: number,
+    height: number,
+  ): { drawWidth: number; drawHeight: number } | null {
     const pane = this.contentEl.getBoundingClientRect();
-    if (pane.width < 1 || pane.height < 1) return;
-
-    const scale = Math.min(pane.width / nativeSize.width, pane.height / nativeSize.height);
-    const width = Math.max(1, Math.round(nativeSize.width * scale));
-    const height = Math.max(1, Math.round(nativeSize.height * scale));
-    const ratio = pixelRatio();
-
-    canvasEl.width = Math.max(1, Math.round(width * ratio));
-    canvasEl.height = Math.max(1, Math.round(height * ratio));
-    canvasEl.style.width = `${width}px`;
-    canvasEl.style.height = `${height}px`;
-    this.slot?.resize(canvasEl.width, canvasEl.height);
+    if (pane.width < 1 || pane.height < 1) return null;
+    const scale = Math.min(pane.width / width, pane.height / height);
+    return {
+      drawWidth: Math.max(1, Math.round(width * scale)),
+      drawHeight: Math.max(1, Math.round(height * scale)),
+    };
   }
 
-  private showNotAnimation(file: TFile): void {
-    const box = this.contentEl.createDiv({ cls: "lottie-thorvg-notice" });
-    box.createEl("p", { text: `${file.name} is not a Lottie animation.` });
-    box
-      .createEl("button", { text: "Open in default app" })
-      .addEventListener("click", () => {
-        // Not in the public typings, but it is what Obsidian itself calls for
-        // a file no view can open.
-        (this.app as App & { openWithDefaultApp(path: string): void }).openWithDefaultApp(
-          file.path,
-        );
-      });
+  protected fillNotLottie(el: HTMLElement): void {
+    const box = el.createDiv({ cls: "lottie-thorvg-notice" });
+    box.createEl("p", { text: `${this.file?.name ?? "This file"} is not a Lottie animation.` });
+    box.createEl("button", { text: "Open in default app" }).addEventListener("click", () => {
+      const path = this.file?.path;
+      if (!path) return;
+      // Not in the public typings, but it is what Obsidian itself calls for a
+      // file no view can open.
+      (this.app as App & { openWithDefaultApp(path: string): void }).openWithDefaultApp(path);
+    });
   }
 }
 
@@ -1607,7 +1590,7 @@ export default class LottiePlugin extends Plugin {
   settings: LottieSettings = { ...DEFAULT_SETTINGS };
 
   /** Every embed and view currently holding an animation. */
-  readonly surfaces = new Set<LottieSurface>();
+  readonly playables = new Set<Playable>();
 
   index!: LottieIndex;
 
@@ -1635,7 +1618,7 @@ export default class LottiePlugin extends Plugin {
     // would keep only the last file of a batch.
     const changed = new Set<TFile>();
     const flush = debounce(() => {
-      for (const file of changed) this.redrawSurfacesOf(file);
+      for (const file of changed) this.redrawFile(file);
       changed.clear();
     }, 150, true);
     this.index = this.addChild(
@@ -1704,7 +1687,7 @@ export default class LottiePlugin extends Plugin {
     this.settings.autoplay = autoplay;
     await this.saveData(this.settings);
     const paused = this.startPaused();
-    for (const surface of this.surfaces) surface.setPaused(paused);
+    for (const playable of this.playables) playable.setPaused(paused);
   }
 
   async setRenderer(renderer: RendererType): Promise<void> {
@@ -1721,7 +1704,7 @@ export default class LottiePlugin extends Plugin {
     await this.transition(async () => {
       await this.stopEngine();
       await this.rebuildMarkdownViews();
-      this.redrawAllSurfaces();
+      this.redrawAll();
     });
   }
 
@@ -1746,15 +1729,15 @@ export default class LottiePlugin extends Plugin {
   private onContextRestored(): void {
     void this.transition(async () => {
       await this.stopEngine();
-      this.redrawAllSurfaces();
+      this.redrawAll();
     });
   }
 
   /** Tells everything currently tracked to reload, which lazily rebuilds the
    *  engine too: the first redraw() to ask for a player builds it, and the
    *  rest just get the one that built. */
-  private redrawAllSurfaces(): void {
-    for (const surface of this.surfaces) void surface.redraw();
+  private redrawAll(): void {
+    for (const playable of this.playables) void playable.redraw();
   }
 
   /** Runs one change of engine, once the one before it has finished. */
@@ -1791,7 +1774,7 @@ export default class LottiePlugin extends Plugin {
       this.state = "ready";
       // stopEngine() above released every surface's slot; the caller is about
       // to reattach itself, but the rest need telling too.
-      if (healing) this.redrawAllSurfaces();
+      if (healing) this.redrawAll();
       return this.player;
     } catch (error) {
       this.engine = null;
@@ -1811,7 +1794,7 @@ export default class LottiePlugin extends Plugin {
     if (this.state === "idle") return;
 
     this.state = "stopping";
-    for (const surface of this.surfaces) surface.release();
+    for (const playable of this.playables) playable.release();
     try {
       this.player?.destroy();
       this.engine?.term();
@@ -1823,9 +1806,9 @@ export default class LottiePlugin extends Plugin {
     this.state = "idle";
   }
 
-  private redrawSurfacesOf(file: TFile): void {
-    for (const surface of this.surfaces) {
-      if (surface.file === file) void surface.redraw();
+  private redrawFile(file: TFile): void {
+    for (const playable of this.playables) {
+      if (playable.file === file) void playable.redraw();
     }
   }
 
