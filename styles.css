@@ -7,13 +7,13 @@
 
 /* The canvas and its pause button, in a box of the canvas's size. The canvas is
    a block inside it, so the box sits on the line the way the canvas alone did. */
-.lottie-thorvg-stage {
+.lottie-thorvg-box {
   position: relative;
   display: inline-block;
   max-width: 100%;
 }
 
-.lottie-thorvg-stage canvas {
+.lottie-thorvg-box canvas {
   display: block;
 }
 
@@ -28,8 +28,8 @@
   opacity: 0;
 }
 
-.lottie-thorvg-stage:hover .lottie-thorvg-toggle,
-.lottie-thorvg-stage[data-paused] .lottie-thorvg-toggle,
+.lottie-thorvg-box:hover .lottie-thorvg-toggle,
+.lottie-thorvg-box[data-paused] .lottie-thorvg-toggle,
 .lottie-thorvg-toggle:focus-visible {
   opacity: 1;
 }

@@ -966,61 +966,36 @@ function describeCanvas(el: HTMLCanvasElement, name: string | null): void {
   }
 }
 
+/** The elements one animation is shown with. Whoever owns them drives them. */
+interface LottieElements {
+  boxEl: HTMLElement; // a span sized to the canvas, so the button can sit over it
+  canvasEl: HTMLCanvasElement;
+  buttonEl: HTMLButtonElement;
+}
+
 /**
- * The canvas an animation is shown on, and the button that pauses it, in a box
- * of the canvas's size so the button can sit over it. The pause is kept here
- * and not on the slot, because the player can take a slot back to make room
- * and a new one takes its place.
+ * Builds the three, with `onToggle` called when the button is pressed.
  *
- * WCAG 2.2.2 asks for this: motion that starts by itself and lasts more than
- * five seconds needs a way to pause it. The button's label says what it will
- * do, as gifa11y's does, and names the animation when it has a name.
+ * WCAG 2.2.2 asks for the button: motion that starts by itself and lasts more
+ * than five seconds needs a way to pause it.
  */
-class Stage {
-  readonly canvasEl: HTMLCanvasElement;
-  private el: HTMLElement;
-  private buttonEl: HTMLButtonElement;
-  private name: string | null = null;
+function createLottieElements(parent: HTMLElement, onToggle: () => void): LottieElements {
+  const boxEl = parent.createSpan({ cls: "lottie-thorvg-box" });
+  const canvasEl = boxEl.createEl("canvas");
+  const buttonEl = boxEl.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
+  buttonEl.addEventListener("click", onToggle);
+  return { boxEl, canvasEl, buttonEl };
+}
 
-  constructor(
-    parent: HTMLElement,
-    name: string | null,
-    private slot: () => Slot | null,
-    public paused = false,
-  ) {
-    this.el = parent.createSpan({ cls: "lottie-thorvg-stage" });
-    this.canvasEl = this.el.createEl("canvas");
-    this.buttonEl = this.el.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
-    this.buttonEl.addEventListener("click", () => this.setPaused(!this.paused));
-    this.describe(name);
-  }
-
-  /** Pauses or plays from outside the button, as the autoplay setting does. */
-  setPaused(paused: boolean): void {
-    if (paused === this.paused) return;
-    this.paused = paused;
-    this.update();
-    this.apply(this.slot());
-  }
-
-  describe(name: string | null): void {
-    this.name = name;
-    describeCanvas(this.canvasEl, name);
-    this.update();
-  }
-
-  /** Carries the pause over to a slot, which may be one just given. */
-  apply(slot: Slot | null): void {
-    if (this.paused) slot?.pause();
-    else slot?.play();
-  }
-
-  private update(): void {
-    const action = this.paused ? "Play animation" : "Pause animation";
-    this.buttonEl.setAttribute("aria-label", this.name ? `${action}: ${this.name}` : action);
-    setIcon(this.buttonEl, this.paused ? "play" : "pause");
-    this.el.toggleAttribute("data-paused", this.paused);
-  }
+/**
+ * Shows what pressing the button will do. The label says the action rather
+ * than the state, as gifa11y's does, and names the animation when it has a name.
+ */
+function describeToggle(els: LottieElements, paused: boolean, name: string | null): void {
+  const action = paused ? "Play animation" : "Pause animation";
+  els.buttonEl.setAttribute("aria-label", name ? `${action}: ${name}` : action);
+  setIcon(els.buttonEl, paused ? "play" : "pause");
+  els.boxEl.toggleAttribute("data-paused", paused);
 }
 
 /**
@@ -1051,8 +1026,10 @@ interface Reading {
  * share everything else.
  */
 abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface {
-  private stage: Stage | null = null;
+  private elements: LottieElements | null = null;
   private slot: Slot | null = null;
+  /** Paused by the viewer or by the autoplay setting. Outlives any one slot. */
+  private paused: boolean;
   /** The animation's own dimensions, before any alias size is applied. */
   private nativeSize: Size | null = null;
   private observer: IntersectionObserver | null = null;
@@ -1070,6 +1047,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     protected plugin: LottiePlugin,
   ) {
     super(containerEl);
+    this.paused = plugin.startPaused();
   }
 
   /** The size from the cheapest place there is, so the note can be laid out first. */
@@ -1187,7 +1165,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
 
     const { drawWidth, drawHeight } = this.drawSize(native.width, native.height);
     const ratio = pixelRatio();
-    const el = this.ensureStage().canvasEl;
+    const el = this.ensureElements().canvasEl;
 
     el.width = Math.max(1, Math.round(drawWidth * ratio));
     el.height = Math.max(1, Math.round(drawHeight * ratio));
@@ -1200,22 +1178,37 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     const alignment = requestedAlignment(this.containerEl);
     if (alignment) this.containerEl.dataset.align = alignment;
     else delete this.containerEl.dataset.align;
-    this.stage?.describe(accessibleName(this.containerEl));
+    this.describe();
     this.place();
   }
 
-  private ensureStage(): Stage {
-    this.stage ??= new Stage(
-      this.containerEl,
-      accessibleName(this.containerEl),
-      () => this.slot,
-      this.plugin.startPaused(),
-    );
-    return this.stage;
+  private ensureElements(): LottieElements {
+    if (!this.elements) {
+      this.elements = createLottieElements(this.containerEl, () => this.setPaused(!this.paused));
+      this.describe();
+    }
+    return this.elements;
+  }
+
+  /** Names the animation on its canvas and on its button. */
+  private describe(): void {
+    if (!this.elements) return;
+    const name = accessibleName(this.containerEl);
+    describeCanvas(this.elements.canvasEl, name);
+    describeToggle(this.elements, this.paused, name);
   }
 
   setPaused(paused: boolean): void {
-    this.stage?.setPaused(paused);
+    if (paused === this.paused) return;
+    this.paused = paused;
+    this.describe();
+    this.applyPause();
+  }
+
+  /** Puts the pause into effect on whatever slot the embed holds. */
+  private applyPause(): void {
+    if (this.paused) this.slot?.pause();
+    else this.slot?.play();
   }
 
   /** Asks the player for a slot, which loads the animation to fill it. */
@@ -1240,12 +1233,8 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
 
       // A Lottie that never said how large it is has had no canvas to lay out
       // with. It gets one at whatever size, and ThorVG's answer sizes it after.
-      const stage = this.ensureStage();
-      const slot = await player.acquire(
-        json,
-        stage.canvasEl,
-        () => this.onScreen && !this.tornDown,
-      );
+      const els = this.ensureElements();
+      const slot = await player.acquire(json, els.canvasEl, () => this.onScreen && !this.tornDown);
       if (!slot) return;
       if (this.tornDown) {
         slot.release();
@@ -1260,7 +1249,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
         this.nativeSize = slot.native;
         this.place();
       }
-      stage.apply(slot);
+      this.applyPause();
       if (this.onScreen) slot.show();
     } catch (error) {
       this.fail(error);
@@ -1300,7 +1289,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     this.detach();
     this.observer?.disconnect();
     this.containerEl.empty();
-    this.stage = null;
+    this.elements = null;
     this.fillNotLottie(this.containerEl);
   }
 
@@ -1308,7 +1297,7 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
     console.error("Lottie:", error);
     this.detach();
     this.containerEl.empty();
-    this.stage = null;
+    this.elements = null;
     this.containerEl.createDiv({
       cls: "lottie-thorvg-error",
       text: `Could not render ${this.name}`,
@@ -1398,8 +1387,10 @@ const VIEW_TYPE = "lottie";
  * the behaviour it had before.
  */
 class LottieView extends FileView implements LottieSurface {
-  private stage: Stage | null = null;
+  private elements: LottieElements | null = null;
   private slot: Slot | null = null;
+  /** Paused by the viewer or by the autoplay setting. Outlives any one slot. */
+  private paused = false;
   private nativeSize: Size | null = null;
   private visibility: IntersectionObserver | null = null;
   private attaching = false;
@@ -1463,13 +1454,30 @@ class LottieView extends FileView implements LottieSurface {
   }
 
   setPaused(paused: boolean): void {
-    this.stage?.setPaused(paused);
+    if (paused === this.paused) return;
+    this.paused = paused;
+    this.describe();
+    this.applyPause();
+  }
+
+  /** Puts the pause into effect on whatever slot the view holds. */
+  private applyPause(): void {
+    if (this.paused) this.slot?.pause();
+    else this.slot?.play();
+  }
+
+  /** Names the animation on its canvas and on its button. */
+  private describe(): void {
+    if (!this.elements) return;
+    const name = this.file?.name ?? null;
+    describeCanvas(this.elements.canvasEl, name);
+    describeToggle(this.elements, this.paused, name);
   }
 
   async redraw(): Promise<void> {
     // Already reloading — see LottieEmbed.redraw() for why this is skipped.
     if (this.attaching) return;
-    if (this.file) await this.show(this.file, this.stage?.paused);
+    if (this.file) await this.show(this.file, this.paused);
   }
 
   // The animation is drawn at the size it is shown at, so a resized pane needs
@@ -1483,7 +1491,8 @@ class LottieView extends FileView implements LottieSurface {
     this.detach();
     const content = this.contentEl;
     content.empty();
-    this.stage = null;
+    this.elements = null;
+    this.paused = paused;
     content.addClass("lottie-thorvg-view");
 
     const size = await this.plugin.index.ensure(file);
@@ -1494,14 +1503,15 @@ class LottieView extends FileView implements LottieSurface {
     }
 
     this.nativeSize = size.width > 0 ? size : null;
-    this.stage = new Stage(content, file.name, () => this.slot, paused);
+    this.elements = createLottieElements(content, () => this.setPaused(!this.paused));
+    this.describe();
     this.fit();
     await this.attach();
   }
 
   private async attach(): Promise<void> {
     const file = this.file;
-    if (this.attaching || !file || !this.stage || !this.onScreen) return;
+    if (this.attaching || !file || !this.elements || !this.onScreen) return;
     this.attaching = true;
     try {
       const json = await this.app.vault.cachedRead(file);
@@ -1510,18 +1520,18 @@ class LottieView extends FileView implements LottieSurface {
       if (!size) {
         this.detach();
         this.contentEl.empty();
-        this.stage = null;
+        this.elements = null;
         this.showNotAnimation(file);
         return;
       }
 
       const player = await this.plugin.ensurePlayer();
-      const stage = this.stage;
-      if (this.file !== file || !this.onScreen || !stage) return;
+      const els = this.elements;
+      if (this.file !== file || !this.onScreen || !els) return;
 
       const slot = await player.acquire(
         json,
-        stage.canvasEl,
+        els.canvasEl,
         () => this.file === file && this.onScreen,
       );
       if (!slot) return;
@@ -1537,12 +1547,12 @@ class LottieView extends FileView implements LottieSurface {
         this.nativeSize = slot.native;
         this.fit();
       }
-      stage.apply(slot);
+      this.applyPause();
       if (this.onScreen) slot.show();
     } catch (error) {
       console.error("Lottie:", error);
       this.contentEl.empty();
-      this.stage = null;
+      this.elements = null;
       this.contentEl.createDiv({
         cls: "lottie-thorvg-error",
         text: `Could not render ${file.name}`,
@@ -1560,7 +1570,7 @@ class LottieView extends FileView implements LottieSurface {
   /** Scales the animation to fill the pane, keeping its proportions. */
   private fit(): void {
     const { nativeSize } = this;
-    const canvasEl = this.stage?.canvasEl;
+    const canvasEl = this.elements?.canvasEl;
     if (!nativeSize || !canvasEl) return;
 
     const pane = this.contentEl.getBoundingClientRect();
