@@ -100,10 +100,12 @@ const CODE_BLOCK_LANGUAGE = "lottie";
 
 interface LottieSettings {
   renderer: RendererType;
+  autoplay: boolean;
 }
 
 const DEFAULT_SETTINGS: LottieSettings = {
   renderer: "sw",
+  autoplay: true,
 };
 
 const RENDERER_LABELS: Record<RendererType, string> = {
@@ -114,6 +116,14 @@ const RENDERER_LABELS: Record<RendererType, string> = {
 
 /** How far outside the window an animation still counts as worth drawing. */
 const NEAR_SCREEN = 200;
+
+/**
+ * Whether the system asks for less movement. An animation then starts paused
+ * whatever the autoplay setting says, and the button is there to play it.
+ */
+function reducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
 
 /**
  * Device pixels per CSS pixel, damped as ThorVG damps it: a 2x display costs
@@ -981,12 +991,16 @@ class Stage {
     this.el = parent.createSpan({ cls: "lottie-thorvg-stage" });
     this.canvasEl = this.el.createEl("canvas");
     this.buttonEl = this.el.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
-    this.buttonEl.addEventListener("click", () => {
-      this.paused = !this.paused;
-      this.update();
-      this.apply(this.slot());
-    });
+    this.buttonEl.addEventListener("click", () => this.setPaused(!this.paused));
     this.describe(name);
+  }
+
+  /** Pauses or plays from outside the button, as the autoplay setting does. */
+  setPaused(paused: boolean): void {
+    if (paused === this.paused) return;
+    this.paused = paused;
+    this.update();
+    this.apply(this.slot());
   }
 
   describe(name: string | null): void {
@@ -1021,6 +1035,8 @@ interface LottieSurface {
   release(): void;
   /** Re-reads the file and shows it again. */
   redraw(): Promise<void>;
+  /** Stops or plays the animation, as the autoplay setting is switched. */
+  setPaused(paused: boolean): void;
 }
 
 /** What reading an animation yields: its text, and its size if it is one. */
@@ -1189,8 +1205,17 @@ abstract class LottieEmbed extends MarkdownRenderChild implements LottieSurface 
   }
 
   private ensureStage(): Stage {
-    this.stage ??= new Stage(this.containerEl, accessibleName(this.containerEl), () => this.slot);
+    this.stage ??= new Stage(
+      this.containerEl,
+      accessibleName(this.containerEl),
+      () => this.slot,
+      this.plugin.startPaused(),
+    );
     return this.stage;
+  }
+
+  setPaused(paused: boolean): void {
+    this.stage?.setPaused(paused);
   }
 
   /** Asks the player for a slot, which loads the animation to fill it. */
@@ -1437,6 +1462,10 @@ class LottieView extends FileView implements LottieSurface {
     this.detach();
   }
 
+  setPaused(paused: boolean): void {
+    this.stage?.setPaused(paused);
+  }
+
   async redraw(): Promise<void> {
     // Already reloading — see LottieEmbed.redraw() for why this is skipped.
     if (this.attaching) return;
@@ -1450,7 +1479,7 @@ class LottieView extends FileView implements LottieSurface {
   }
 
   /** `paused` carries a pause over when the same file is shown again. */
-  private async show(file: TFile, paused = false): Promise<void> {
+  private async show(file: TFile, paused = this.plugin.startPaused()): Promise<void> {
     this.detach();
     const content = this.contentEl;
     content.empty();
@@ -1649,6 +1678,25 @@ export default class LottiePlugin extends Plugin {
     return this.transition(() => this.startEngine());
   }
 
+  /** Whether an animation is to sit on its first frame until it is played. */
+  startPaused(): boolean {
+    return !this.settings.autoplay || reducedMotion();
+  }
+
+  /**
+   * Takes every animation with it, including ones a viewer paused by hand,
+   * since the setting is one switch for the whole vault. Under reduced motion
+   * they stay paused, so that what is on screen matches what a new animation
+   * would do.
+   */
+  async setAutoplay(autoplay: boolean): Promise<void> {
+    if (autoplay === this.settings.autoplay) return;
+    this.settings.autoplay = autoplay;
+    await this.saveData(this.settings);
+    const paused = this.startPaused();
+    for (const surface of this.surfaces) surface.setPaused(paused);
+  }
+
   async setRenderer(renderer: RendererType): Promise<void> {
     if (renderer === this.settings.renderer) return;
     this.settings.renderer = renderer;
@@ -1811,6 +1859,23 @@ class LottieSettingTab extends PluginSettingTab {
           });
         },
       },
+      {
+        name: "Autoplay",
+        desc: "Play animations as soon as they appear. With this off, an animation sits on its first frame until you press play. Animations start paused either way when your system asks for reduced motion.",
+        control: { type: "toggle", key: "autoplay", defaultValue: DEFAULT_SETTINGS.autoplay },
+      },
     ];
+  }
+
+  /**
+   * Autoplay is bound to its key, but switching it also has to reach the
+   * animations already on screen, so the write goes through the plugin.
+   */
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    if (key !== "autoplay") {
+      await super.setControlValue(key, value);
+      return;
+    }
+    await this.plugin.setAutoplay(Boolean(value));
   }
 }

@@ -73,6 +73,10 @@ Every animation has a pause button in its bottom-left corner. It appears when yo
 
 Changing it redraws everything on screen.
 
+**Autoplay** plays an animation as soon as it appears. It is on by default. With it off, an animation waits on its first frame until you press play.
+
+Animations start paused either way when your system is set to reduce motion.
+
 ## Development
 
 ```bash
