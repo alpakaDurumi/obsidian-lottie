@@ -6,6 +6,7 @@ import {
   MarkdownView,
   Plugin,
   PluginSettingTab,
+  Scope,
   type SettingDefinitionItem,
   TAbstractFile,
   TFile,
@@ -355,6 +356,21 @@ interface Pending {
 }
 
 /**
+ * The smallest frame change ThorVG acts on, as its documentation gives it. A
+ * closer one is refused, which reaches us as an exception.
+ */
+const FRAME_TOLERANCE = 0.001;
+
+/**
+ * The highest whole frame an animation can be shown at, counting from 0. The
+ * count comes in as op - ip, which exporters write as a float, so the fraction
+ * is dropped and only played through. lottie-web counts the same way.
+ */
+function lastFrame(slot: Slot): number {
+  return Math.max(0, Math.floor(slot.frames) - 1);
+}
+
+/**
  * One animation's place on the shared canvas, and the canvas it is copied to.
  * Sizes and offsets are in device pixels: the shared canvas has ThorVG's own
  * scaling turned off, so they can be handed straight to drawImage.
@@ -364,6 +380,8 @@ class Slot {
   y = 0;
   /** Where the animation has got to, in frames; fractional between frames. */
   frame = 0;
+  /** The frame ThorVG was last given. It starts showing the first one. */
+  applied = 0;
   /** Off screen: still loaded and still placed, but out of the scene. */
   visible = false;
   /** When it was last on screen, so the stalest can be evicted first. */
@@ -381,6 +399,9 @@ class Slot {
   dirty = true;
   /** Part of what the player draws each frame. */
   inScene = false;
+
+  /** Called after ThorVG has been moved, for whoever shows where it is. */
+  onFrame: (() => void) | null = null;
 
   /** Where the pixels are copied to, when a player copies them. */
   target: CanvasRenderingContext2D | null = null;
@@ -506,10 +527,16 @@ abstract class Player {
     this.sync(slot);
   }
 
-  /** Moves the animation to a frame. Even a paused slot is drawn once at it. */
+  /**
+   * Moves the animation to a frame. Even a paused slot is drawn once at it.
+   * ThorVG leaves the range to the caller, so it is kept here, where every
+   * request from outside arrives. Past either end stops at that end.
+   */
   seek(slot: Slot, frame: number): void {
-    if (slot.released || frame === slot.frame) return;
-    slot.frame = frame;
+    if (slot.released || !Number.isFinite(frame)) return;
+    const wanted = Math.min(Math.max(frame, 0), lastFrame(slot));
+    if (wanted === slot.frame) return;
+    slot.frame = wanted;
     this.applyFrame(slot);
     slot.dirty = true;
     this.sync(slot);
@@ -598,6 +625,8 @@ abstract class Player {
         native,
         Math.max(1, target.width),
         Math.max(1, target.height),
+        // Kept as given, fraction and all: this is where playing wraps, and
+        // rounding either way would overrun the animation or cut its tail.
         Math.max(1, info?.totalFrames ?? 1),
         info?.fps || 60,
       );
@@ -631,10 +660,18 @@ abstract class Player {
     }
   }
 
-  /** Hands the slot's frame to ThorVG. A refusal stops only this slot. */
+  /**
+   * Hands the slot's frame to ThorVG, unless it is too close to the one showing
+   * to be taken, which throws. The comparison is against what ThorVG was last
+   * given, not where the slot has counted to: an off-screen slot counts on
+   * undrawn. A refusal stops only this slot.
+   */
   private applyFrame(slot: Slot): void {
+    if (Math.abs(slot.frame - slot.applied) < FRAME_TOLERANCE) return;
     try {
       slot.animation.frame(slot.frame);
+      slot.applied = slot.frame;
+      slot.onFrame?.();
     } catch (error) {
       slot.stalled = true;
       console.error("Lottie: could not advance an animation", error);
@@ -669,11 +706,7 @@ abstract class Player {
 
     for (const slot of this.slots) {
       if (slot.stalled || slot.paused) continue;
-      // ThorVG treats a frame it is already showing as a failure, and the first
-      // tick of a new slot asks for exactly that.
-      const frame = (slot.frame + slot.fps * elapsed) % slot.frames;
-      if (frame === slot.frame) continue;
-      slot.frame = frame;
+      slot.frame = (slot.frame + slot.fps * elapsed) % slot.frames;
       if (slot.visible) this.applyFrame(slot);
     }
 
@@ -971,6 +1004,12 @@ interface LottieElements {
   boxEl: HTMLElement; // a span sized to the canvas, so the button can sit over it
   canvasEl: HTMLCanvasElement;
   buttonEl: HTMLButtonElement;
+  /** The area the box is centred in, for a surface with controls under it. */
+  stageEl: HTMLElement | null;
+  /** The bar a frame is reached with, for a surface that asked for one. */
+  scrubEl: HTMLInputElement | null;
+  /** Where the frame is written out, beside the bar. */
+  countEl: HTMLElement | null;
 }
 
 /**
@@ -979,12 +1018,29 @@ interface LottieElements {
  * WCAG 2.2.2 asks for the button: motion that starts by itself and lasts more
  * than five seconds needs a way to pause it.
  */
-function createLottieElements(parent: HTMLElement, onToggle: () => void): LottieElements {
-  const boxEl = parent.createSpan({ cls: "lottie-thorvg-box" });
+function createLottieElements(
+  parent: HTMLElement,
+  onToggle: () => void,
+  controls: boolean,
+): LottieElements {
+  // With controls the animation is centred in an area of its own, so the row
+  // beneath keeps its height.
+  const stageEl = controls ? parent.createDiv({ cls: "lottie-thorvg-stage" }) : null;
+  const boxEl = (stageEl ?? parent).createSpan({ cls: "lottie-thorvg-box" });
   const canvasEl = boxEl.createEl("canvas");
   const buttonEl = boxEl.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
   buttonEl.addEventListener("click", onToggle);
-  return { boxEl, canvasEl, buttonEl };
+  if (!stageEl) return { boxEl, canvasEl, buttonEl, stageEl, scrubEl: null, countEl: null };
+
+  const rowEl = parent.createDiv({ cls: "lottie-thorvg-controls" });
+  // Left without a range: the frame count is known only once ThorVG has read
+  // the animation, which is after this.
+  const scrubEl = rowEl.createEl("input", {
+    cls: "lottie-thorvg-scrub",
+    attr: { type: "range", min: "0", max: "0", step: "1", disabled: true, "aria-label": "Frame" },
+  });
+  const countEl = rowEl.createSpan({ cls: "lottie-thorvg-count" });
+  return { boxEl, canvasEl, buttonEl, stageEl, scrubEl, countEl };
 }
 
 /**
@@ -1055,6 +1111,10 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
     private nativeSize: Size | null = null;
     private observer: IntersectionObserver | null = null;
     private onScreen = false;
+    /** The viewer is holding the scrub bar, so the frame is theirs to set. */
+    private grabbed = false;
+    /** The window is watched for the end of a hold once, not once per bar. */
+    private watchingPointer = false;
     private attaching = false;
     private mounted = false;
     /** rootEl holds a notice or an error message instead of the animation. */
@@ -1085,6 +1145,10 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
     ): { drawWidth: number; drawHeight: number } | null;
     /** The text assistive technology is given, or null for decoration. */
     protected abstract describeAs(): string | null;
+    /** Whether a bar is shown to reach a frame with, and the keys can seek. */
+    protected get scrubbable(): boolean {
+      return false;
+    }
     /** Watches whatever else the size or the name is read from. */
     protected observeSource(): void {}
     /** Drops what observeSource() set up. */
@@ -1100,6 +1164,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       const mount = ++this.generation;
       this.mounted = true;
       this.paused = this.plugin.startPaused();
+      this.grabbed = false;
       this.replaced = false;
       this.nativeSize = null;
       this.onScreen = false;
@@ -1213,6 +1278,83 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.paused = paused;
       this.describe();
       this.applyPause();
+      // Playing runs between whole frames, so stopping lands on the nearest,
+      // leaving what is drawn the frame the row names.
+      if (paused) this.slot?.seek(this.shownFrame());
+    }
+
+    /** Lets the bar set the frame. Taking hold of it stops the animation. */
+    private wireScrub(el: HTMLInputElement | null): void {
+      if (!el) return;
+      el.addEventListener("pointerdown", () => {
+        this.grabbed = true;
+        this.setPaused(true);
+      });
+      el.addEventListener("input", () => this.seekTo(Number(el.value)));
+      // The bar's own window, since a tab can be popped out, and a drag can end
+      // off the bar or be taken over as a gesture. Registered once: the
+      // elements are rebuilt per file, and each rebuild would leave a listener.
+      if (this.watchingPointer) return;
+      this.watchingPointer = true;
+      const drop = () => {
+        this.grabbed = false;
+      };
+      this.registerDomEvent(el.win, "pointerup", drop);
+      this.registerDomEvent(el.win, "pointercancel", drop);
+    }
+
+    /** Puts the bar and the count where the animation is. */
+    private showFrame(): void {
+      const els = this.elements;
+      if (!els?.scrubEl || !els.countEl) return;
+      const last = this.slot ? lastFrame(this.slot) : 0;
+      const frame = this.shownFrame();
+      els.scrubEl.disabled = !this.slot;
+      if (els.scrubEl.max !== String(last)) {
+        els.scrubEl.max = String(last);
+        // Held at its widest reading, so the bar keeps its own width.
+        els.countEl.style.minWidth = `${String(last).length * 2 + 3}ch`;
+      }
+      // The bar is the viewer's while held, and writing to it would fight the
+      // drag. The count is only read, so it follows either way.
+      if (!this.grabbed) els.scrubEl.value = String(frame);
+      els.countEl.setText(`${frame} / ${last}`);
+    }
+
+    /** The area the animation is centred in, for a surface that has controls. */
+    protected get stageEl(): HTMLElement | null {
+      return this.elements?.stageEl ?? null;
+    }
+
+    /** Stops or plays, as the button does, for a key that asks for the same. */
+    protected togglePause(): void {
+      this.setPaused(!this.paused);
+    }
+
+    /** Shows one whole frame and holds there: asking for a frame stops on it. */
+    protected seekTo(frame: number): void {
+      if (!this.slot) return;
+      this.setPaused(true);
+      this.slot.seek(Math.round(frame));
+    }
+
+    /** The whole frame nearest where the animation is, held to the last one. */
+    private shownFrame(): number {
+      if (!this.slot) return 0;
+      return Math.min(Math.round(this.slot.frame), lastFrame(this.slot));
+    }
+
+    /**
+     * Steps by whole frames from the one on show. What happens at either end is
+     * the caller's to say: a held key stops there, a fresh press comes round.
+     */
+    protected seekBy(frames: number, wrap: boolean): void {
+      if (!this.slot) return;
+      const last = lastFrame(this.slot);
+      const next = this.shownFrame() + frames;
+      if (next < 0) this.seekTo(wrap ? last : 0);
+      else if (next > last) this.seekTo(wrap ? 0 : last);
+      else this.seekTo(next);
     }
 
     /** Puts the pause into effect on whatever slot is held. */
@@ -1231,8 +1373,14 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
 
     private ensureElements(): LottieElements {
       if (!this.elements) {
-        this.elements = createLottieElements(this.rootEl, () => this.setPaused(!this.paused));
+        this.elements = createLottieElements(
+          this.rootEl,
+          () => this.setPaused(!this.paused),
+          this.scrubbable,
+        );
+        this.wireScrub(this.elements.scrubEl);
         this.describe();
+        this.showFrame();
       }
       return this.elements;
     }
@@ -1246,10 +1394,12 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       const native = this.nativeSize;
       if (!native || native.width <= 0 || native.height <= 0 || !this.mounted) return;
 
+      // Built before the size is worked out, since a surface with controls
+      // measures the area they leave the animation.
+      const el = this.ensureElements().canvasEl;
       const drawn = this.drawSize(native.width, native.height);
       if (!drawn) return;
       const ratio = pixelRatio();
-      const el = this.ensureElements().canvasEl;
 
       el.width = Math.max(1, Math.round(drawn.drawWidth * ratio));
       el.height = Math.max(1, Math.round(drawn.drawHeight * ratio));
@@ -1298,6 +1448,8 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
         // from the frame that one was at.
         if (this.slot?.released) slot.seek(this.slot.frame);
         this.slot = slot;
+        slot.onFrame = () => this.showFrame();
+        this.showFrame();
         if (!this.nativeSize?.width) {
           this.nativeSize = slot.native;
           this.place();
@@ -1313,8 +1465,10 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
 
     /** Gives the animation up. The canvas keeps its last frame. */
     private detach(): void {
+      if (this.slot) this.slot.onFrame = null;
       this.slot?.release();
       this.slot = null;
+      this.showFrame();
     }
 
     private showNotLottie(): void {
@@ -1508,10 +1662,32 @@ class LottieView extends withAnimation(FileView) implements Playable {
     protected readonly plugin: LottiePlugin,
   ) {
     super(leaf);
+    // A tab is where these keys are free: in a note they move the editor's
+    // cursor. A scope is in force only while its own tab is in front.
+    this.scope = new Scope(this.app.scope);
+    // A repeat is a held key, which stops at the end. A fresh press comes round.
+    this.scope.register([], "ArrowLeft", (evt) => {
+      this.seekBy(-1, !evt.repeat);
+      return false;
+    });
+    this.scope.register([], "ArrowRight", (evt) => {
+      this.seekBy(1, !evt.repeat);
+      return false;
+    });
+    // Returning false keeps space from also pressing the focused control.
+    this.scope.register([], " ", () => {
+      this.togglePause();
+      return false;
+    });
   }
 
   protected get rootEl(): HTMLElement {
     return this.contentEl;
+  }
+
+  /** A tab shows one animation to look at, so it is the side that can seek. */
+  protected get scrubbable(): boolean {
+    return true;
   }
 
   protected get label(): string {
@@ -1559,12 +1735,12 @@ class LottieView extends withAnimation(FileView) implements Playable {
     return readAnimation(this.plugin, this.file);
   }
 
-  /** Scales the animation to fill the pane, keeping its proportions. */
+  /** Scales the animation to fill the area above the controls, keeping its proportions. */
   protected drawSize(
     width: number,
     height: number,
   ): { drawWidth: number; drawHeight: number } | null {
-    const pane = this.contentEl.getBoundingClientRect();
+    const pane = (this.stageEl ?? this.contentEl).getBoundingClientRect();
     if (pane.width < 1 || pane.height < 1) return null;
     const scale = Math.min(pane.width / width, pane.height / height);
     return {

@@ -87,15 +87,95 @@
   min-height: calc(var(--icon-size) + var(--size-2-2) * 4);
 }
 
-/* The tab a .json animation opens in. */
+/* The tab a .json animation opens in: the animation above, its controls below. */
 .lottie-thorvg-view {
   display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Both take the place of the animation, so both are centred the same way. Auto
+   margins, since the column no longer centres what is in it. */
+.lottie-thorvg-notice,
+.lottie-thorvg-view > .lottie-thorvg-error {
+  margin: auto;
+  text-align: center;
+}
+
+.lottie-thorvg-notice {
+  color: var(--text-muted);
+}
+
+/* The animation is centred in what the controls leave, and cannot push past it. */
+.lottie-thorvg-stage {
+  display: flex;
+  flex: 1;
+  min-height: 0;
   align-items: center;
   justify-content: center;
   overflow: hidden;
 }
 
-.lottie-thorvg-notice {
-  text-align: center;
+/* The row under a tab's animation. Always shown, unlike the pause button: a tab
+   is where an animation is examined rather than read past. */
+.lottie-thorvg-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-4);
+  padding: var(--size-4-3) var(--size-4-4);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* Sized here rather than left to the theme, since this bar is dragged to a
+   frame. The line is the input's own background and the track fills the box, so
+   the thumb sits on the line by filling it too rather than by an offset. */
+.lottie-thorvg-controls input.lottie-thorvg-scrub {
+  flex: 1;
+  min-width: 0;
+  height: var(--size-4-4);
+  margin: 0;
+  padding: 0;
+  border: none;
+  background:
+    linear-gradient(var(--background-modifier-border), var(--background-modifier-border)) center /
+    100% var(--size-4-1) no-repeat;
+  appearance: none;
+}
+
+.lottie-thorvg-controls input.lottie-thorvg-scrub::-webkit-slider-runnable-track {
+  height: 100%;
+  border: none;
+  background: none;
+}
+
+/* Obsidian lifts its own thumb with `top: -6px`, sized for its settings
+   sliders. Hover and active are matched too, or its rules win there. */
+.lottie-thorvg-controls input.lottie-thorvg-scrub::-webkit-slider-thumb,
+.lottie-thorvg-controls input.lottie-thorvg-scrub::-webkit-slider-thumb:hover,
+.lottie-thorvg-controls input.lottie-thorvg-scrub::-webkit-slider-thumb:active {
+  width: var(--size-4-4);
+  height: var(--size-4-4);
+  top: 0;
+  margin: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  box-shadow: none;
+  opacity: 1;
+  appearance: none;
+}
+
+.lottie-thorvg-controls input.lottie-thorvg-scrub:disabled::-webkit-slider-thumb {
+  background: var(--background-modifier-border);
+}
+
+/* Every digit the same width, ranged right. Its own width is set from the frame
+   count, so the bar does not move as the number grows. */
+.lottie-thorvg-count {
+  flex: none;
+  text-align: right;
   color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  font-variant-numeric: tabular-nums;
 }

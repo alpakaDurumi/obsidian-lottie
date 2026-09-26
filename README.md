@@ -20,6 +20,7 @@ Follow the steps below to install Lottie.
 - **Code blocks** — paste an animation's JSON into a `lottie` code block.
 - **Open on a tab** — clicking a file in the explorer plays it full pane.
 - **Pause and play** — a button on each animation stops it on the current frame.
+- **Frame by frame** — a tab has a seek bar, and the arrow keys step one frame.
 - **Live updates** — editing an animation in another program updates it in Obsidian straight away.
 - **Select rendering backends** — CPU, WebGL or WebGPU, switchable in settings.
 
