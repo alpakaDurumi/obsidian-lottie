@@ -1029,6 +1029,13 @@ function createLottieElements(
   const boxEl = (stageEl ?? parent).createSpan({ cls: "lottie-thorvg-box" });
   const canvasEl = boxEl.createEl("canvas");
   const buttonEl = boxEl.createEl("button", { cls: "lottie-thorvg-toggle clickable-icon" });
+  // Focuses the button on both engines. Chromium does this itself on a press,
+  // WebKit does not, and there the press reaches the editor behind a Live
+  // Preview embed and moves its caret into the source.
+  buttonEl.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    buttonEl.focus();
+  });
   buttonEl.addEventListener("click", onToggle);
   if (!stageEl) return { boxEl, canvasEl, buttonEl, stageEl, scrubEl: null, countEl: null };
 
