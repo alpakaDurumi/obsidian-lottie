@@ -1042,9 +1042,19 @@ function createLottieElements(
   const rowEl = parent.createDiv({ cls: "lottie-thorvg-controls" });
   // Left without a range: the frame count is known only once ThorVG has read
   // the animation, which is after this.
+  // data-ignore-swipe keeps Obsidian's mobile gestures from reading a drag along
+  // the bar as a swipe and opening a side panel. Its own sliders carry the same.
   const scrubEl = rowEl.createEl("input", {
     cls: "lottie-thorvg-scrub",
-    attr: { type: "range", min: "0", max: "0", step: "1", disabled: true, "aria-label": "Frame" },
+    attr: {
+      type: "range",
+      min: "0",
+      max: "0",
+      step: "1",
+      disabled: true,
+      "aria-label": "Frame",
+      "data-ignore-swipe": "true",
+    },
   });
   const countEl = rowEl.createSpan({ cls: "lottie-thorvg-count" });
   return { boxEl, canvasEl, buttonEl, stageEl, scrubEl, countEl };
