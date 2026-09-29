@@ -2,6 +2,7 @@ import {
   App,
   Component,
   FileView,
+  Keymap,
   MarkdownRenderChild,
   MarkdownView,
   Plugin,
@@ -1198,6 +1199,23 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
     protected abstract readJson(): Promise<string>;
     /** Fills rootEl in place of an animation, for a source that is not one. */
     protected abstract fillNotLottie(el: HTMLElement): void;
+    /**
+     * Fills rootEl for a source that could not be read, which says that rather
+     * than that the source is not an animation, which is not known.
+     */
+    protected fillUnreadable(el: HTMLElement): void {
+      el.createDiv({ cls: "lottie-thorvg-notice", text: `Waiting for ${this.label}` });
+    }
+
+    /** Puts rootEl back to the bare state a mount starts from. */
+    private resetRoot(): void {
+      this.rootEl.empty();
+      this.elements = null;
+      // Whatever a fill left behind, including Obsidian's own card classes.
+      this.rootEl.removeClasses(["file-embed", "mod-generic"]);
+      this.rootEl.addClass("lottie-thorvg");
+      this.rootEl.dataset.renderer = this.plugin.settings.renderer;
+    }
     /** The size to draw at, or null while that cannot be worked out yet. */
     protected abstract drawSize(
       width: number,
@@ -1229,10 +1247,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.nativeSize = null;
       this.onScreen = false;
       this.plugin.playables.add(this);
-      this.rootEl.empty();
-      this.elements = null;
-      this.rootEl.addClass("lottie-thorvg");
-      this.rootEl.dataset.renderer = this.plugin.settings.renderer;
+      this.resetRoot();
 
       // Take the space before anything is drawn. Everything below turns on
       // whether the animation is on screen, and one that has not drawn has no
@@ -1257,6 +1272,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       // An unreadable source carries on with no size, to be given an observer:
       // the file is released without changing, so nothing announces it and
       // coming into view is the occasion to read again.
+      if (verdict.kind === "unknown") this.fillUnreadable(this.rootEl);
 
       this.observer = new IntersectionObserver(
         (entries) => {
@@ -1502,6 +1518,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
             return;
           }
           if (reading.verdict.kind === "unknown") return;
+          this.resetRoot();
           this.nativeSize = reading.verdict.size;
           this.refresh();
           json = reading.json;
@@ -1668,6 +1685,9 @@ class FileEmbed extends LottieEmbed {
     containerEl: HTMLElement,
     plugin: LottiePlugin,
     readonly file: TFile,
+    /** What the embed links to, so the card can open it as Obsidian's does. */
+    private readonly linktext: string,
+    private readonly sourcePath: string,
   ) {
     super(containerEl, plugin);
   }
@@ -1694,13 +1714,39 @@ class FileEmbed extends LottieEmbed {
    * render skips this component entirely and Obsidian draws its own card.
    */
   protected fillNotLottie(el: HTMLElement): void {
+    this.fillCard(el, "file", this.file.name);
+  }
+
+  /**
+   * Unlike the card above, this one opens the file when pressed. The file is
+   * the only place left to look at a source that will not read, and nothing
+   * else here leads to it.
+   *
+   * The press is heard on the title rather than on the container, since the
+   * container outlives the card: a source that turns out to be readable after
+   * all empties it and draws the animation there.
+   */
+  protected fillUnreadable(el: HTMLElement): void {
+    const title = this.fillCard(el, "clock", `Waiting for ${this.file.name}`);
+    title.addEventListener("click", (event) => {
+      void this.plugin.app.workspace.openLinkText(
+        this.linktext,
+        this.sourcePath,
+        Keymap.isModEvent(event),
+      );
+    });
+  }
+
+  /** Obsidian's own card for a file it cannot show, with our own label. */
+  private fillCard(el: HTMLElement, icon: string, label: string): HTMLElement {
     el.removeClass("lottie-thorvg");
     delete el.dataset.renderer;
     delete el.dataset.align;
     el.addClasses(["file-embed", "mod-generic"]);
     const title = el.createDiv({ cls: "file-embed-title" });
-    setIcon(title.createSpan({ cls: "file-embed-icon" }), "file");
-    title.appendText(this.file.name);
+    setIcon(title.createSpan({ cls: "file-embed-icon" }), icon);
+    title.appendText(label);
+    return title;
   }
 }
 
@@ -1852,8 +1898,20 @@ class LottieView extends withAnimation(FileView) implements Playable {
   }
 
   protected fillNotLottie(el: HTMLElement): void {
+    this.fillNotice(el, `${this.file?.name ?? "This file"} is not a Lottie animation.`);
+  }
+
+  protected fillUnreadable(el: HTMLElement): void {
+    this.fillNotice(
+      el,
+      `Waiting for ${this.file?.name ?? "this file"}. It appears as soon as the file can be read.`,
+    );
+  }
+
+  /** The tab's stand-in for an animation, with the one thing left to try. */
+  private fillNotice(el: HTMLElement, text: string): void {
     const box = el.createDiv({ cls: "lottie-thorvg-notice" });
-    box.createEl("p", { text: `${this.file?.name ?? "This file"} is not a Lottie animation.` });
+    box.createEl("p", { text });
     box.createEl("button", { text: "Open in default app" }).addEventListener("click", () => {
       const path = this.file?.path;
       if (!path) return;
@@ -1911,7 +1969,9 @@ export default class LottiePlugin extends Plugin {
     // unload cleanly (or another plugin) may already hold the extension.
     if (registry.isExtensionRegistered(EXTENSION)) registry.unregisterExtension(EXTENSION);
     registry.registerExtension(EXTENSION, (ctx, file) =>
-      this.index.isLottie(file) === false ? null : new FileEmbed(ctx.containerEl, this, file),
+      this.index.isLottie(file) === false
+        ? null
+        : new FileEmbed(ctx.containerEl, this, file, ctx.linktext, ctx.sourcePath),
     );
     this.register(() => registry.unregisterExtension(EXTENSION));
 
