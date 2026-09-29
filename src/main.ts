@@ -185,28 +185,49 @@ interface Size {
 }
 
 /**
- * The size a Lottie document was drawn for, or null if the text is not one.
+ * What reading a source settled.
  *
- * A Lottie is a JSON object with a layer list and a frame range; `w` and `h`
+ * `unknown` is the absence of a verdict rather than a verdict of failure, so it
+ * is neither remembered nor shown and whatever is on screen stays. HTML keeps
+ * the same line between an image that is "unavailable" and one that is "broken".
+ *
+ * The causes are kept apart because a different thing rescues each: changed
+ * bytes for `unparsable`, which announces itself, and another read for
+ * `unreadable`, since a file another program holds open is released silently.
+ */
+type Verdict =
+  | { kind: "animation"; size: Size }
+  | { kind: "not-lottie" }
+  | { kind: "unknown"; cause: "unreadable" | "unparsable" };
+
+/**
+ * Reads a Lottie document's verdict out of its text.
+ *
+ * A Lottie is a JSON object with a layer list and a frame range. `w` and `h`
  * are the canvas it was authored against. Reading them here lets an embed take
  * up its space before the animation has loaded. Without that an embed is a
  * point on the line until it draws, and a note full of them shuffles as they
- * appear — which also leaves nothing able to say which of them are on screen.
+ * appear, which also leaves nothing able to say which of them are on screen.
  *
- * A file missing the two is still an animation, only one that cannot be
- * measured until ThorVG has read it; it gets a zero size.
+ * A document missing the two is still an animation, only one that cannot be
+ * measured until ThorVG has read it. It gets a zero size.
  */
-function lottieSize(text: string): Size | null {
+function lottieVerdict(text: string): Verdict {
+  let doc: unknown;
   try {
-    const doc: unknown = JSON.parse(text);
-    if (typeof doc !== "object" || doc === null) return null;
-    const { layers, fr, op, w, h } = doc as Record<string, unknown>;
-    if (!Array.isArray(layers) || typeof fr !== "number" || typeof op !== "number") return null;
-    const measured = typeof w === "number" && typeof h === "number" && w > 0 && h > 0;
-    return measured ? { width: w, height: h } : { width: 0, height: 0 };
+    doc = JSON.parse(text);
   } catch {
-    return null;
+    // Nothing was learned about the source, not even that it is not an animation.
+    return { kind: "unknown", cause: "unparsable" };
   }
+  // Whatever parsed is settled: a truncated document throws above instead.
+  if (typeof doc !== "object" || doc === null) return { kind: "not-lottie" };
+  const { layers, fr, op, w, h } = doc as Record<string, unknown>;
+  if (!Array.isArray(layers) || typeof fr !== "number" || typeof op !== "number") {
+    return { kind: "not-lottie" };
+  }
+  const measured = typeof w === "number" && typeof h === "number" && w > 0 && h > 0;
+  return { kind: "animation", size: measured ? { width: w, height: h } : { width: 0, height: 0 } };
 }
 
 /**
@@ -217,10 +238,13 @@ function lottieSize(text: string): Size | null {
  * Lottie until read.
  */
 class LottieIndex extends Component {
-  /** Null for a `.json` that is not an animation, missing while unread. */
+  /**
+   * Null for a `.json` that is not an animation, missing while unread. A read
+   * that settled nothing leaves it missing, so the next asker reads again.
+   */
   private known = new Map<string, Size | null>();
   /** Reads in flight, so embeds of one file opening together share one. */
-  private reading = new Map<string, Promise<Size | null>>();
+  private reading = new Map<string, Promise<Verdict>>();
 
   /**
    * @param onModified Called after a `.json` has been re-classified, so an
@@ -263,9 +287,11 @@ class LottieIndex extends Component {
   }
 
   /** The same answer, reading the file now if nothing has read it yet. */
-  async ensure(file: TFile): Promise<Size | null> {
+  async ensure(file: TFile): Promise<Verdict> {
     const known = this.known.get(file.path);
-    if (known !== undefined) return known;
+    if (known !== undefined) {
+      return known === null ? { kind: "not-lottie" } : { kind: "animation", size: known };
+    }
     const reading = this.reading.get(file.path) ?? this.read(file);
     this.reading.set(file.path, reading);
     try {
@@ -275,19 +301,26 @@ class LottieIndex extends Component {
     }
   }
 
-  remember(file: TFile, size: Size | null): void {
-    this.known.set(file.path, size);
+  /** Keeps a settled verdict. An unsettled one drops whatever was there. */
+  remember(file: TFile, verdict: Verdict): void {
+    if (verdict.kind === "animation") this.known.set(file.path, verdict.size);
+    else if (verdict.kind === "not-lottie") this.known.set(file.path, null);
+    else this.known.delete(file.path);
   }
 
-  private async read(file: TFile): Promise<Size | null> {
+  private async read(file: TFile): Promise<Verdict> {
+    let text: string;
     try {
-      const size = lottieSize(await this.app.vault.cachedRead(file));
-      this.known.set(file.path, size);
-      return size;
-    } catch {
+      text = await this.app.vault.cachedRead(file);
+    } catch (error) {
+      // No bytes, so nothing about the file is settled either way.
+      console.error("Lottie: could not read", file.path, error);
       this.known.delete(file.path);
-      return null;
+      return { kind: "unknown", cause: "unreadable" };
     }
+    const verdict = lottieVerdict(text);
+    this.remember(file, verdict);
+    return verdict;
   }
 
   private async classify(file: TAbstractFile): Promise<void> {
@@ -1087,18 +1120,26 @@ interface Playable {
   setPaused(paused: boolean): void;
 }
 
-/** What reading an animation yields: its text, and its size if it is one. */
+/** What reading an animation yields: its text, and what that text settled. */
 interface Reading {
   json: string;
-  size: Size | null;
+  verdict: Verdict;
 }
 
 /** Reads an animation out of the vault, telling the index what it found. */
 async function readAnimation(plugin: LottiePlugin, file: TFile): Promise<Reading> {
-  const json = await plugin.app.vault.cachedRead(file);
-  const size = lottieSize(json);
-  plugin.index.remember(file, size);
-  return { json, size };
+  let json: string;
+  try {
+    json = await plugin.app.vault.cachedRead(file);
+  } catch (error) {
+    console.error("Lottie: could not read", file.path, error);
+    const verdict: Verdict = { kind: "unknown", cause: "unreadable" };
+    plugin.index.remember(file, verdict);
+    return { json: "", verdict };
+  }
+  const verdict = lottieVerdict(json);
+  plugin.index.remember(file, verdict);
+  return { json, verdict };
 }
 
 /**
@@ -1150,9 +1191,11 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
     protected abstract readonly label: string;
 
     /** The size from the cheapest place there is, to lay out with before drawing. */
-    protected abstract measure(): Promise<Size | null>;
-    /** Reads the animation afresh. */
+    protected abstract measure(): Promise<Verdict>;
+    /** Reads the animation afresh, to find out whether it is still one. */
     protected abstract read(): Promise<Reading>;
+    /** Just the text, for a load that has nothing left to find out. */
+    protected abstract readJson(): Promise<string>;
     /** Fills rootEl in place of an animation, for a source that is not one. */
     protected abstract fillNotLottie(el: HTMLElement): void;
     /** The size to draw at, or null while that cannot be worked out yet. */
@@ -1195,14 +1238,25 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       // whether the animation is on screen, and one that has not drawn has no
       // position worth asking about. Nor can its neighbours have one while it
       // sits between them with no size.
-      const size = await this.measure();
+      const verdict = await this.measure();
       if (this.generation !== mount) return;
-      if (!size) {
+      if (verdict.kind === "not-lottie") {
         this.showNotLottie();
         return;
       }
-      this.nativeSize = size;
-      this.refresh();
+      if (verdict.kind === "unknown" && verdict.cause === "unparsable") {
+        // Not a document, though it may be one mid-write. Nothing to show and
+        // nothing to claim: the next change to the bytes arrives as a redraw.
+        this.standBy();
+        return;
+      }
+      if (verdict.kind === "animation") {
+        this.nativeSize = verdict.size;
+        this.refresh();
+      }
+      // An unreadable source carries on with no size, to be given an observer:
+      // the file is released without changing, so nothing announces it and
+      // coming into view is the occasion to read again.
 
       this.observer = new IntersectionObserver(
         (entries) => {
@@ -1264,23 +1318,26 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       // Already reloading. A redraw asked for while attach() is in flight
       // would only redo its read and parse, then find attach()'s guard and stop.
       if (!this.mounted || this.attaching) return;
-      // showNotLottie() and fail() took the elements and the observer with
-      // them, so a source that is an animation again is built from nothing.
+      // standBy() and fail() took the elements and the observer with them, so
+      // a source that is an animation again is built from nothing.
       if (this.replaced) {
         await this.mount();
         return;
       }
       const mount = this.generation;
       try {
-        const { size } = await this.read();
+        const { verdict } = await this.read();
         if (this.generation !== mount) return;
-        if (!size) {
+        // Read mid-write. What is on screen read cleanly, so it stays, and the
+        // write's own change event brings us back.
+        if (verdict.kind === "unknown") return;
+        if (verdict.kind === "not-lottie") {
           this.detach();
           this.showNotLottie();
           return;
         }
-        if (size.width > 0) {
-          this.nativeSize = size;
+        if (verdict.size.width > 0) {
+          this.nativeSize = verdict.size;
           this.place();
         }
         this.detach();
@@ -1431,17 +1488,25 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       const mount = this.generation;
       this.attaching = true;
       try {
-        const { json, size } = await this.read();
+        // Usually the text alone: what the source is and how large were settled
+        // before this ran. A source with no size settled nothing, so this is the
+        // read it was waiting for and it validates as well.
+        let json: string;
+        if (this.nativeSize) {
+          json = await this.readJson();
+        } else {
+          const reading = await this.read();
+          if (this.generation !== mount) return;
+          if (reading.verdict.kind === "not-lottie") {
+            this.showNotLottie();
+            return;
+          }
+          if (reading.verdict.kind === "unknown") return;
+          this.nativeSize = reading.verdict.size;
+          this.refresh();
+          json = reading.json;
+        }
         if (this.generation !== mount) return;
-        if (!size) {
-          this.showNotLottie();
-          return;
-        }
-        // A source with no size of its own could not be laid out until now.
-        if (size.width > 0 && !this.nativeSize?.width) {
-          this.nativeSize = size;
-          this.place();
-        }
 
         const player = await this.plugin.ensurePlayer();
         // The awaits above give the note time to close, or to scroll away.
@@ -1488,13 +1553,18 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.showFrame();
     }
 
-    private showNotLottie(): void {
+    /** Gives up the animation and empties rootEl for whoever fills it. */
+    private standBy(): void {
       this.replaced = true;
       this.detach();
       this.observer?.disconnect();
       this.observer = null;
       this.rootEl.empty();
       this.elements = null;
+    }
+
+    private showNotLottie(): void {
+      this.standBy();
       this.fillNotLottie(this.rootEl);
     }
 
@@ -1606,12 +1676,16 @@ class FileEmbed extends LottieEmbed {
     return this.file.name;
   }
 
-  protected measure(): Promise<Size | null> {
+  protected measure(): Promise<Verdict> {
     return this.plugin.index.ensure(this.file);
   }
 
   protected read(): Promise<Reading> {
     return readAnimation(this.plugin, this.file);
+  }
+
+  protected readJson(): Promise<string> {
+    return this.plugin.app.vault.cachedRead(this.file);
   }
 
   /**
@@ -1634,7 +1708,7 @@ class FileEmbed extends LottieEmbed {
 class BlockEmbed extends LottieEmbed {
   readonly file = null;
   protected readonly label = "lottie code block";
-  private readonly size: Size | null;
+  private readonly verdict: Verdict;
 
   constructor(
     containerEl: HTMLElement,
@@ -1642,15 +1716,21 @@ class BlockEmbed extends LottieEmbed {
     private text: string,
   ) {
     super(containerEl, plugin);
-    this.size = lottieSize(text);
+    // A block's text arrives whole, so text that does not parse is final.
+    const verdict = lottieVerdict(text);
+    this.verdict = verdict.kind === "unknown" ? { kind: "not-lottie" } : verdict;
   }
 
-  protected measure(): Promise<Size | null> {
-    return Promise.resolve(this.size);
+  protected measure(): Promise<Verdict> {
+    return Promise.resolve(this.verdict);
   }
 
   protected read(): Promise<Reading> {
-    return Promise.resolve({ json: this.text, size: this.size });
+    return Promise.resolve({ json: this.text, verdict: this.verdict });
+  }
+
+  protected readJson(): Promise<string> {
+    return Promise.resolve(this.text);
   }
 
   protected fillNotLottie(el: HTMLElement): void {
@@ -1743,13 +1823,18 @@ class LottieView extends withAnimation(FileView) implements Playable {
     return this.file?.name ?? null;
   }
 
-  protected measure(): Promise<Size | null> {
-    return this.file ? this.plugin.index.ensure(this.file) : Promise.resolve(null);
+  protected measure(): Promise<Verdict> {
+    if (!this.file) return Promise.resolve({ kind: "not-lottie" });
+    return this.plugin.index.ensure(this.file);
   }
 
   protected read(): Promise<Reading> {
-    if (!this.file) return Promise.resolve({ json: "", size: null });
+    if (!this.file) return Promise.resolve({ json: "", verdict: { kind: "not-lottie" } });
     return readAnimation(this.plugin, this.file);
+  }
+
+  protected readJson(): Promise<string> {
+    return this.file ? this.app.vault.cachedRead(this.file) : Promise.resolve("");
   }
 
   /** Scales the animation to fill the area above the controls, keeping its proportions. */
