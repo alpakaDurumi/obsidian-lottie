@@ -22,9 +22,9 @@ There is no test suite. Behaviour is verified by hand in `test-vault/`.
 - `test-vault/` is written by `scripts/install.mjs`. Edits there are overwritten
   by the next build.
 - `manifest.json`'s `version` and `versions.json` are written by `npm version`
-  (`scripts/version-bump.mjs`). Don't edit them by hand. `versions.json` needs a
-  row only for a release that changes `minAppVersion`, and the row has to name
-  the newest release that still runs on the older floor.
+  (`scripts/version-bump.mjs`). Don't edit them by hand. `versions.json` keeps
+  one row per `minAppVersion`, naming the newest release that needs it. A release
+  on the same floor replaces that row, and one that raises the floor adds a row.
 
 ## Pitfalls
 
