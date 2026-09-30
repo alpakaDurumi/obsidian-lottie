@@ -1717,11 +1717,10 @@ class FileEmbed extends LottieEmbed {
   }
 
   /**
-   * A `.json` that is not a Lottie document gets the card Obsidian shows for
-   * any other file.
+   * A `.json` that is not a Lottie document gets Obsidian's file card, saying so.
    */
   protected fillNotLottie(el: HTMLElement): void {
-    this.fillCard(el, "file", this.file.name);
+    this.fillCard(el, "file", `${this.file.name} is not a Lottie file`);
   }
 
   protected fillUnreadable(el: HTMLElement): void {
@@ -1915,7 +1914,7 @@ class LottieView extends withAnimation(FileView) implements Playable {
   }
 
   protected fillNotLottie(el: HTMLElement): void {
-    this.fillNotice(el, `${this.file?.name ?? "This file"} is not a Lottie animation.`);
+    this.fillNotice(el, `${this.file?.name ?? "This file"} is not a Lottie file.`);
   }
 
   protected fillUnreadable(el: HTMLElement): void {
