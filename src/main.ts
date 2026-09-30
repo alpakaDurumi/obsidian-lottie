@@ -139,8 +139,7 @@ function pixelRatio(): number {
 // Obsidian's embed registry is not in the public typings, but it is the one
 // hook every embed path goes through — reading view, Live Preview and hover
 // popovers all end up in `embedRegistry.getEmbedCreator(file)`. A Markdown
-// post-processor only ever sees the reading-view pass. A creator that returns
-// null hands the embed back to Obsidian's own generic file card.
+// post-processor only ever sees the reading-view pass.
 interface EmbedContext {
   app: App;
   containerEl: HTMLElement;
@@ -233,10 +232,8 @@ function lottieVerdict(text: string): Verdict {
 
 /**
  * Remembers which `.json` files are Lottie documents and how large they are,
- * so the embed creator — which has to answer synchronously — can leave
- * everything else to Obsidian. Files are classified in the background after
- * startup and re-checked as they change; an unknown file is assumed to be
- * Lottie until read.
+ * so an embed can take its space before anything is drawn. Files are
+ * classified in the background after startup and re-checked as they change.
  */
 class LottieIndex extends Component {
   /**
@@ -281,13 +278,7 @@ class LottieIndex extends Component {
     });
   }
 
-  /** `undefined` while the file has not been read yet. */
-  isLottie(file: TFile): boolean | undefined {
-    const known = this.known.get(file.path);
-    return known === undefined ? undefined : known !== null;
-  }
-
-  /** The same answer, reading the file now if nothing has read it yet. */
+  /** The verdict for a file, reading it now if nothing has read it yet. */
   async ensure(file: TFile): Promise<Verdict> {
     const known = this.known.get(file.path);
     if (known !== undefined) {
@@ -1207,10 +1198,28 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       el.createDiv({ cls: "lottie-thorvg-notice", text: `Waiting for ${this.label}` });
     }
 
-    /** Puts rootEl back to the bare state a mount starts from. */
-    private resetRoot(): void {
+    /** Listeners a fill puts on rootEl itself, which outlives what it drew. */
+    private fillListeners = new AbortController();
+
+    /** For a fill to pass as `signal`, so its listeners go when rootEl is emptied. */
+    protected get fillSignal(): AbortSignal {
+      return this.fillListeners.signal;
+    }
+
+    private dropFillListeners(): void {
+      this.fillListeners.abort();
+      this.fillListeners = new AbortController();
+    }
+
+    private emptyRoot(): void {
+      this.dropFillListeners();
       this.rootEl.empty();
       this.elements = null;
+    }
+
+    /** Puts rootEl back to the bare state a mount starts from. */
+    private resetRoot(): void {
+      this.emptyRoot();
       // Whatever a fill left behind, including Obsidian's own card classes.
       this.rootEl.removeClasses(["file-embed", "mod-generic"]);
       this.rootEl.addClass("lottie-thorvg");
@@ -1306,6 +1315,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.observer = null;
       this.unobserveSource();
       this.plugin.playables.delete(this);
+      this.dropFillListeners();
       this.release();
     }
 
@@ -1576,8 +1586,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.detach();
       this.observer?.disconnect();
       this.observer = null;
-      this.rootEl.empty();
-      this.elements = null;
+      this.emptyRoot();
     }
 
     private showNotLottie(): void {
@@ -1589,8 +1598,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       console.error("Lottie:", error);
       this.replaced = true;
       this.detach();
-      this.rootEl.empty();
-      this.elements = null;
+      this.emptyRoot();
       this.rootEl.createDiv({
         cls: "lottie-thorvg-error",
         text: `Could not render ${this.label}`,
@@ -1685,7 +1693,7 @@ class FileEmbed extends LottieEmbed {
     containerEl: HTMLElement,
     plugin: LottiePlugin,
     readonly file: TFile,
-    /** What the embed links to, so the card can open it as Obsidian's does. */
+    /** What the embed links to, so the card can open it when pressed. */
     private readonly linktext: string,
     private readonly sourcePath: string,
   ) {
@@ -1709,36 +1717,24 @@ class FileEmbed extends LottieEmbed {
   }
 
   /**
-   * A `.json` that is not a Lottie document gets the same card Obsidian shows
-   * for any other file. From now on the index knows the file, so the next
-   * render skips this component entirely and Obsidian draws its own card.
+   * A `.json` that is not a Lottie document gets the card Obsidian shows for
+   * any other file.
    */
   protected fillNotLottie(el: HTMLElement): void {
     this.fillCard(el, "file", this.file.name);
   }
 
-  /**
-   * Unlike the card above, this one opens the file when pressed. The file is
-   * the only place left to look at a source that will not read, and nothing
-   * else here leads to it.
-   *
-   * The press is heard on the title rather than on the container, since the
-   * container outlives the card: a source that turns out to be readable after
-   * all empties it and draws the animation there.
-   */
   protected fillUnreadable(el: HTMLElement): void {
-    const title = this.fillCard(el, "clock", `Waiting for ${this.file.name}`);
-    title.addEventListener("click", (event) => {
-      void this.plugin.app.workspace.openLinkText(
-        this.linktext,
-        this.sourcePath,
-        Keymap.isModEvent(event),
-      );
-    });
+    this.fillCard(el, "clock", `Waiting for ${this.file.name}`);
   }
 
-  /** Obsidian's own card for a file it cannot show, with our own label. */
-  private fillCard(el: HTMLElement, icon: string, label: string): HTMLElement {
+  /**
+   * Obsidian's own card for a file it cannot show, with our own label, opening
+   * the file when pressed. It is wired as Obsidian wires its file links: the
+   * middle button's mousedown is refused, or it starts autoscroll and no
+   * auxclick follows. The listeners sit on the whole card and go with it.
+   */
+  private fillCard(el: HTMLElement, icon: string, label: string): void {
     el.removeClass("lottie-thorvg");
     delete el.dataset.renderer;
     delete el.dataset.align;
@@ -1746,7 +1742,28 @@ class FileEmbed extends LottieEmbed {
     const title = el.createDiv({ cls: "file-embed-title" });
     setIcon(title.createSpan({ cls: "file-embed-icon" }), icon);
     title.appendText(label);
-    return title;
+
+    const signal = this.fillSignal;
+    el.addEventListener(
+      "mousedown",
+      (event) => {
+        if (event.button === 1) event.preventDefault();
+      },
+      { signal },
+    );
+    // onClickEvent listens for click and auxclick both.
+    el.onClickEvent(
+      (event) => {
+        if (event.button !== 0 && event.button !== 1) return;
+        event.preventDefault();
+        void this.plugin.app.workspace.openLinkText(
+          this.linktext,
+          this.sourcePath,
+          Keymap.isModEvent(event),
+        );
+      },
+      { signal },
+    );
   }
 }
 
@@ -1968,10 +1985,12 @@ export default class LottiePlugin extends Plugin {
     // registerExtension throws on a duplicate, and a plugin that failed to
     // unload cleanly (or another plugin) may already hold the extension.
     if (registry.isExtensionRegistered(EXTENSION)) registry.unregisterExtension(EXTENSION);
-    registry.registerExtension(EXTENSION, (ctx, file) =>
-      this.index.isLottie(file) === false
-        ? null
-        : new FileEmbed(ctx.containerEl, this, file, ctx.linktext, ctx.sourcePath),
+    // Every `.json` embed is drawn here, including one that is not an animation.
+    // Handing that one back to Obsidian would give it Obsidian's own card, which
+    // opens the file on a click but not on a middle click, unlike this plugin's.
+    registry.registerExtension(
+      EXTENSION,
+      (ctx, file) => new FileEmbed(ctx.containerEl, this, file, ctx.linktext, ctx.sourcePath),
     );
     this.register(() => registry.unregisterExtension(EXTENSION));
 
