@@ -97,7 +97,7 @@ function accessibleName(el: HTMLElement): string | null {
 /** File extension claimed for `![[…]]` embeds. */
 const EXTENSION = "json";
 
-/** Language of the code blocks that hold an animation's JSON directly. */
+/** Language of the code blocks that hold a Lottie document directly. */
 const CODE_BLOCK_LANGUAGE = "lottie";
 
 interface LottieSettings {
@@ -196,7 +196,7 @@ interface Size {
  * `unreadable`, since a file another program holds open is released silently.
  */
 type Verdict =
-  | { kind: "animation"; size: Size }
+  | { kind: "lottie"; size: Size }
   | { kind: "not-lottie" }
   | { kind: "unknown"; cause: "unreadable" | "unparsable" };
 
@@ -209,15 +209,15 @@ type Verdict =
  * point on the line until it draws, and a note full of them shuffles as they
  * appear, which also leaves nothing able to say which of them are on screen.
  *
- * A document missing the two is still an animation, only one that cannot be
- * measured until ThorVG has read it. It gets a zero size.
+ * A document missing the two is still a Lottie document, only one that cannot
+ * be measured until ThorVG has read it. It gets a zero size.
  */
 function lottieVerdict(text: string): Verdict {
   let doc: unknown;
   try {
     doc = JSON.parse(text);
   } catch {
-    // Nothing was learned about the source, not even that it is not an animation.
+    // Nothing was learned about the source, not even that it is not a Lottie document.
     return { kind: "unknown", cause: "unparsable" };
   }
   // Whatever parsed is settled: a truncated document throws above instead.
@@ -227,7 +227,7 @@ function lottieVerdict(text: string): Verdict {
     return { kind: "not-lottie" };
   }
   const measured = typeof w === "number" && typeof h === "number" && w > 0 && h > 0;
-  return { kind: "animation", size: measured ? { width: w, height: h } : { width: 0, height: 0 } };
+  return { kind: "lottie", size: measured ? { width: w, height: h } : { width: 0, height: 0 } };
 }
 
 /**
@@ -237,7 +237,7 @@ function lottieVerdict(text: string): Verdict {
  */
 class LottieIndex extends Component {
   /**
-   * Null for a `.json` that is not an animation, missing while unread. A read
+   * Null for a `.json` that is not a Lottie document, missing while unread. A read
    * that settled nothing leaves it missing, so the next asker reads again.
    */
   private known = new Map<string, Size | null>();
@@ -282,7 +282,7 @@ class LottieIndex extends Component {
   async ensure(file: TFile): Promise<Verdict> {
     const known = this.known.get(file.path);
     if (known !== undefined) {
-      return known === null ? { kind: "not-lottie" } : { kind: "animation", size: known };
+      return known === null ? { kind: "not-lottie" } : { kind: "lottie", size: known };
     }
     const reading = this.reading.get(file.path) ?? this.read(file);
     this.reading.set(file.path, reading);
@@ -295,7 +295,7 @@ class LottieIndex extends Component {
 
   /** Keeps a settled verdict. An unsettled one drops whatever was there. */
   remember(file: TFile, verdict: Verdict): void {
-    if (verdict.kind === "animation") this.known.set(file.path, verdict.size);
+    if (verdict.kind === "lottie") this.known.set(file.path, verdict.size);
     else if (verdict.kind === "not-lottie") this.known.set(file.path, null);
     else this.known.delete(file.path);
   }
@@ -1112,13 +1112,13 @@ interface Playable {
   setPaused(paused: boolean): void;
 }
 
-/** What reading an animation yields: its text, and what that text settled. */
+/** What reading a source yields: its text, and what that text settled. */
 interface Reading {
   json: string;
   verdict: Verdict;
 }
 
-/** Reads an animation out of the vault, telling the index what it found. */
+/** Reads a `.json` out of the vault, telling the index what it found. */
 async function readAnimation(plugin: LottiePlugin, file: TFile): Promise<Reading> {
   let json: string;
   try {
@@ -1184,15 +1184,15 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
 
     /** The size from the cheapest place there is, to lay out with before drawing. */
     protected abstract measure(): Promise<Verdict>;
-    /** Reads the animation afresh, to find out whether it is still one. */
+    /** Reads the source afresh, to find out whether it is still a Lottie document. */
     protected abstract read(): Promise<Reading>;
     /** Just the text, for a load that has nothing left to find out. */
     protected abstract readJson(): Promise<string>;
-    /** Fills rootEl in place of an animation, for a source that is not one. */
+    /** Fills rootEl in place of an animation, for a source that is not a Lottie document. */
     protected abstract fillNotLottie(el: HTMLElement): void;
     /**
      * Fills rootEl for a source that could not be read, which says that rather
-     * than that the source is not an animation, which is not known.
+     * than that the source is not a Lottie document, which is not known.
      */
     protected fillUnreadable(el: HTMLElement): void {
       el.createDiv({ cls: "lottie-thorvg-notice", text: `Waiting for ${this.label}` });
@@ -1274,7 +1274,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
         this.standBy();
         return;
       }
-      if (verdict.kind === "animation") {
+      if (verdict.kind === "lottie") {
         this.nativeSize = verdict.size;
         this.refresh();
       }
@@ -1338,14 +1338,14 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
      * Reloads after the source changed, the way Obsidian's own embeds do. Text
      * that is not JSON at all is left alone rather than replacing a working
      * animation, since an editor saving over the file can be caught mid-write.
-     * JSON that is simply no longer an animation is a real change.
+     * JSON that is simply no longer a Lottie document is a real change.
      */
     async redraw(): Promise<void> {
       // Already reloading. A redraw asked for while attach() is in flight
       // would only redo its read and parse, then find attach()'s guard and stop.
       if (!this.mounted || this.attaching) return;
       // standBy() and fail() took the elements and the observer with them, so
-      // a source that is an animation again is built from nothing.
+      // a source that is a Lottie document again is built from nothing.
       if (this.replaced) {
         await this.mount();
         return;
@@ -1766,7 +1766,7 @@ class FileEmbed extends LottieEmbed {
   }
 }
 
-/** A `lottie` code block, whose animation is the text of the block itself. */
+/** A `lottie` code block, whose Lottie document is the text of the block itself. */
 class BlockEmbed extends LottieEmbed {
   readonly file = null;
   protected readonly label = "lottie code block";
@@ -1796,11 +1796,11 @@ class BlockEmbed extends LottieEmbed {
   }
 
   protected fillNotLottie(el: HTMLElement): void {
-    el.createDiv({ cls: "lottie-thorvg-error", text: "Not a Lottie animation" });
+    el.createDiv({ cls: "lottie-thorvg-error", text: "Not Lottie JSON" });
   }
 }
 
-/** View type opening a `.json` animation on its own tab. */
+/** View type opening a `.json` on its own tab. */
 const VIEW_TYPE = "lottie";
 
 /**
@@ -1809,7 +1809,7 @@ const VIEW_TYPE = "lottie";
  * Lottie file in the explorer ends up in a text editor.
  *
  * Registration is per extension, so this claims every `.json`. One that is not
- * an animation gets a note saying so and a way to open it outside Obsidian,
+ * a Lottie file gets a note saying so and a way to open it outside Obsidian,
  * which is the behaviour it had before.
  */
 class LottieView extends withAnimation(FileView) implements Playable {
@@ -1924,7 +1924,7 @@ class LottieView extends withAnimation(FileView) implements Playable {
     );
   }
 
-  /** The tab's stand-in for an animation, with the one thing left to try. */
+  /** What the tab shows in place of an animation, with the one thing left to try. */
   private fillNotice(el: HTMLElement, text: string): void {
     const box = el.createDiv({ cls: "lottie-thorvg-notice" });
     box.createEl("p", { text });
@@ -1984,7 +1984,7 @@ export default class LottiePlugin extends Plugin {
     // registerExtension throws on a duplicate, and a plugin that failed to
     // unload cleanly (or another plugin) may already hold the extension.
     if (registry.isExtensionRegistered(EXTENSION)) registry.unregisterExtension(EXTENSION);
-    // Every `.json` embed is drawn here, including one that is not an animation.
+    // Every `.json` embed is drawn here, including one that is not a Lottie file.
     // Handing that one back to Obsidian would give it Obsidian's own card, which
     // opens the file on a click but not on a middle click, unlike this plugin's.
     registry.registerExtension(

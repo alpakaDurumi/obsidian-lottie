@@ -87,7 +87,7 @@
   min-height: calc(var(--icon-size) + var(--size-2-2) * 4);
 }
 
-/* The tab a .json animation opens in: the animation above, its controls below. */
+/* The tab a .json opens in: the animation above, its controls below. */
 .lottie-thorvg-view {
   display: flex;
   flex-direction: column;
