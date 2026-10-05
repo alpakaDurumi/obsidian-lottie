@@ -173,13 +173,34 @@
   background: var(--background-modifier-border);
 }
 
-/* Every digit the same width, ranged right. Its own width is set from the frame
-   count, so the bar does not move as the number grows. */
+/* Every digit has the same width. The plugin sets --lottie-thorvg-digits to the
+   number of digits in the last frame number. So the bar does not move as the
+   number grows. */
 .lottie-thorvg-count {
+  display: flex;
   flex: none;
-  text-align: right;
+  align-items: center;
+  /* The gap is one character, like the space after the slash. */
+  gap: 1ch;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
   font-variant-numeric: tabular-nums;
+}
+
+/* This is Obsidian's own number field, like the PDF viewer's page field. Its
+   height is one line of text, the same as the total beside it. Its width holds
+   the digits plus its padding and border. A shorter number sits in the middle. */
+.lottie-thorvg-controls input.lottie-thorvg-frame {
+  width: calc(
+    var(--lottie-thorvg-digits, 1) * 1ch + 2 * var(--size-4-1) + 2 * var(--input-border-width)
+  );
+  height: auto;
+  padding: var(--size-2-1) var(--size-4-1);
+  text-align: center;
+}
+
+/* The two extra characters are the slash and the space after it. */
+.lottie-thorvg-total {
+  min-width: calc(var(--lottie-thorvg-digits, 1) * 1ch + 2ch);
 }

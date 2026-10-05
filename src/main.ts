@@ -1033,8 +1033,12 @@ interface LottieElements {
   stageEl: HTMLElement | null;
   /** The bar a frame is reached with, for a surface that asked for one. */
   scrubEl: HTMLInputElement | null;
-  /** Where the frame is written out, beside the bar. */
+  /** Holds the field and the total, beside the bar. */
   countEl: HTMLElement | null;
+  /** The field that shows the frame. The viewer can type a frame into it. */
+  frameEl: HTMLInputElement | null;
+  /** Shows the last frame, after the field. */
+  totalEl: HTMLElement | null;
 }
 
 /**
@@ -1062,7 +1066,18 @@ function createLottieElements(
     buttonEl.focus();
   });
   buttonEl.addEventListener("click", onToggle);
-  if (!stageEl) return { boxEl, canvasEl, buttonEl, stageEl, scrubEl: null, countEl: null };
+  if (!stageEl) {
+    return {
+      boxEl,
+      canvasEl,
+      buttonEl,
+      stageEl,
+      scrubEl: null,
+      countEl: null,
+      frameEl: null,
+      totalEl: null,
+    };
+  }
 
   const rowEl = parent.createDiv({ cls: "lottie-thorvg-controls" });
   // Left without a range: the frame count is known only once ThorVG has read
@@ -1082,7 +1097,24 @@ function createLottieElements(
     },
   });
   const countEl = rowEl.createSpan({ cls: "lottie-thorvg-count" });
-  return { boxEl, canvasEl, buttonEl, stageEl, scrubEl, countEl };
+  // The field is type="number", like the PDF viewer's page field. With
+  // inputmode="numeric", the iPhone shows a keypad without a return key. Enter
+  // could not commit there. enterkeyhint="done" makes the action key of the
+  // Android keyboard send Enter.
+  const frameEl = countEl.createEl("input", {
+    cls: "lottie-thorvg-frame",
+    attr: {
+      type: "number",
+      min: "0",
+      max: "0",
+      step: "1",
+      disabled: true,
+      enterkeyhint: "done",
+      "aria-label": "Frame number",
+    },
+  });
+  const totalEl = countEl.createSpan({ cls: "lottie-thorvg-total" });
+  return { boxEl, canvasEl, buttonEl, stageEl, scrubEl, countEl, frameEl, totalEl };
 }
 
 /**
@@ -1403,22 +1435,74 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
       this.registerDomEvent(el.win, "pointercancel", drop);
     }
 
+    /**
+     * Lets the viewer type a frame into the field. Entering the field pauses the
+     * animation, by a press or by Tab. An edit is applied when the field loses
+     * focus. Enter only removes the focus. Escape drops the edit first.
+     */
+    private wireField(el: HTMLInputElement | null): void {
+      if (!el) return;
+      // Without this, leaving an untouched field would seek back over a click on the bar.
+      let edited = false;
+      // Focus covers Tab. Pointerdown is also needed, as on the bar. On touch,
+      // focus arrives only when the finger lifts.
+      el.addEventListener("focus", () => this.setPaused(true));
+      el.addEventListener("pointerdown", () => this.setPaused(true));
+      // Selects the number on every click, as the PDF viewer's page field does.
+      el.addEventListener("click", () => el.select());
+      el.addEventListener("input", () => {
+        edited = true;
+      });
+      el.addEventListener("keydown", (evt) => {
+        if (evt.key === "Escape") edited = false;
+        if (evt.key === "Enter" || evt.key === "Escape") el.blur();
+      });
+      el.addEventListener("blur", () => {
+        const typed = el.value;
+        // A press on the bar also removes the focus. The bar's frame wins then.
+        // Digits only. A sign, a decimal point or an exponent restores the number.
+        if (
+          edited &&
+          !this.grabbed &&
+          this.slot &&
+          /^\d+$/.test(typed) &&
+          Number(typed) <= lastFrame(this.slot)
+        ) {
+          this.seekTo(Number(typed));
+        }
+        edited = false;
+        el.value = String(this.shownFrame());
+      });
+    }
+
+    /**
+     * Whether the frame field has the focus. A window that loses focus still
+     * reports the field as activeElement. So the document's own focus is checked too.
+     */
+    protected get typing(): boolean {
+      const el = this.elements?.frameEl;
+      return !!el && el.doc.hasFocus() && el.doc.activeElement === el;
+    }
+
     /** Puts the bar and the count where the animation is. */
     private showFrame(): void {
       const els = this.elements;
-      if (!els?.scrubEl || !els.countEl) return;
+      if (!els?.scrubEl || !els.countEl || !els.frameEl || !els.totalEl) return;
       const last = this.slot ? lastFrame(this.slot) : 0;
       const frame = this.shownFrame();
       els.scrubEl.disabled = !this.slot;
+      els.frameEl.disabled = !this.slot;
       if (els.scrubEl.max !== String(last)) {
         els.scrubEl.max = String(last);
+        els.frameEl.max = String(last);
         // Held at its widest reading, so the bar keeps its own width.
-        els.countEl.style.minWidth = `${String(last).length * 2 + 3}ch`;
+        els.countEl.setCssProps({ "--lottie-thorvg-digits": String(String(last).length) });
       }
-      // The bar is the viewer's while held, and writing to it would fight the
-      // drag. The count is only read, so it follows either way.
+      // The bar is not written while the viewer holds it. The field is not
+      // written while it has focus. Either write would undo the viewer's input.
       if (!this.grabbed) els.scrubEl.value = String(frame);
-      els.countEl.setText(`${frame} / ${last}`);
+      if (!this.typing) els.frameEl.value = String(frame);
+      els.totalEl.setText(`/ ${last}`);
     }
 
     /** The area the animation is centred in, for a surface that has controls. */
@@ -1479,6 +1563,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
           this.scrubbable,
         );
         this.wireScrub(this.elements.scrubEl);
+        this.wireField(this.elements.frameEl);
         this.describe();
         this.showFrame();
       }
@@ -1824,17 +1909,24 @@ class LottieView extends withAnimation(FileView) implements Playable {
     // A tab is where these keys are free: in a note they move the editor's
     // cursor. A scope is in force only while its own tab is in front.
     this.scope = new Scope(this.app.scope);
+    // The scope gets a key before the focused element. Each handler returns
+    // early while the frame field has focus. Obsidian's canvas does the same for
+    // its inputs. An undefined return does not pass the key on to app.scope.
+    // The field then gets the key as usual.
     // A repeat is a held key, which stops at the end. A fresh press comes round.
     this.scope.register([], "ArrowLeft", (evt) => {
+      if (this.typing) return;
       this.seekBy(-1, !evt.repeat);
       return false;
     });
     this.scope.register([], "ArrowRight", (evt) => {
+      if (this.typing) return;
       this.seekBy(1, !evt.repeat);
       return false;
     });
     // Returning false keeps space from also pressing the focused control.
     this.scope.register([], " ", () => {
+      if (this.typing) return;
       this.togglePause();
       return false;
     });
