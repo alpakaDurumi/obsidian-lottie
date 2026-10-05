@@ -65,7 +65,7 @@ Obsidian hides file types it does not know, so `.json` files will not appear in 
 
 Every animation has a pause button in its bottom-left corner. It appears when you hover over the animation and stays visible while the animation is paused. Press it again to play on from the same frame. On a touch device the button is always shown.
 
-### Settings
+## Settings
 
 Both settings can also be changed from the **command palette**.
 
