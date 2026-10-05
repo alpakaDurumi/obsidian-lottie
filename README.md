@@ -67,6 +67,8 @@ Every animation has a pause button in its bottom-left corner. It appears when yo
 
 ### Settings
 
+Both settings can also be changed from the **command palette**.
+
 **Renderer** picks what draws the animations:
 
 - **Software** — draws on the CPU. Works everywhere. The default, and the one to go back to if an animation will not play or looks wrong.

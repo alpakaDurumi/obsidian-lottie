@@ -2057,6 +2057,24 @@ export default class LottiePlugin extends Plugin {
       (await this.loadData()) as Partial<LottieSettings>,
     );
     this.addSettingTab(new LottieSettingTab(this.app, this));
+    this.addCommand({
+      id: "toggle-autoplay",
+      name: "Toggle autoplay",
+      callback: () => void this.setAutoplay(!this.settings.autoplay),
+    });
+    // The renderer in use has no command, so the palette lists only the ones to
+    // switch to. Names take the dropdown's labels, so both show the same word.
+    for (const [renderer, label] of Object.entries(RENDERER_LABELS) as [RendererType, string][]) {
+      this.addCommand({
+        id: `switch-renderer-to-${renderer}`,
+        name: `Switch renderer to ${label}`,
+        checkCallback: (checking) => {
+          if (renderer === this.settings.renderer) return false;
+          if (!checking) void this.setRenderer(renderer);
+          return true;
+        },
+      });
+    }
     // A burst of saves from an external editor collapses into one reload. The
     // paths are collected rather than passed through the debouncer, which
     // would keep only the last file of a batch.
