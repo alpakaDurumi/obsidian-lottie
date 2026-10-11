@@ -2225,11 +2225,20 @@ export default class LottiePlugin extends Plugin {
     this.state = "starting";
     try {
       const backend = this.settings.renderer;
+      const failed: { error?: Error } = {};
       const engine = await ThorVG.init({
         renderer: backend,
         locateFile: () => wasmBlobUrl(),
+        // With a handler set, ThorVG sends every error here instead of throwing.
+        // All are thrown again except a failed WebGPU setup ("initEngine"). That
+        // one is kept, so init() still returns the engine for the catch to term().
+        onError: (error, { operation }) => {
+          if (operation !== "initEngine") throw error;
+          failed.error = error;
+        },
       });
       this.engine = engine;
+      if (failed.error) throw failed.error;
       this.player =
         backend === "sw"
           ? new DirectPlayer(engine)
@@ -2243,9 +2252,8 @@ export default class LottiePlugin extends Plugin {
       if (healing) this.redrawAll();
       return this.player;
     } catch (error) {
-      this.engine = null;
-      this.player = null;
-      this.state = "idle";
+      // Until term(), ThorVG stays on this backend whatever the next init() asks for.
+      await this.stopEngine();
       throw error;
     }
   }
