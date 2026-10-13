@@ -257,7 +257,6 @@ class LottieIndex extends Component {
 
   onload(): void {
     const { vault } = this.app;
-    this.registerEvent(vault.on("create", (file) => void this.classify(file)));
     this.registerEvent(
       vault.on("modify", (file) => {
         void this.classify(file).then(() => {
@@ -273,7 +272,10 @@ class LottieIndex extends Component {
         if (was !== undefined) this.known.set(file.path, was);
       }),
     );
+    // While the vault loads, it fires "create" for every existing file. The scan
+    // below reads those files too, so the listener is added only once loading is done.
     this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(vault.on("create", (file) => void this.classify(file)));
       for (const file of vault.getFiles()) void this.classify(file);
     });
   }
