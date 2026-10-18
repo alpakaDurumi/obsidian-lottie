@@ -365,14 +365,6 @@ const ATLAS_MAX = 4096;
  */
 const ADMIT_BUDGET_MS = 1000 / 60 / 4;
 
-/** A rectangle given back, handed whole to the next slot of the same size. */
-interface Patch {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 /** An animation waiting its turn to be loaded. */
 interface Pending {
   json: string;
@@ -757,6 +749,95 @@ abstract class Player {
   };
 }
 
+/** A row of the atlas. It takes slots no taller than itself, left to right. */
+interface Row {
+  y: number;
+  height: number;
+  /** Where the next slot goes. Everything to its left stays taken, even once given up. */
+  cursor: number;
+}
+
+/**
+ * Where each slot sits on the atlas. It only answers whether a slot fits. What
+ * to give up when nothing does is the player's decision.
+ *
+ * A row records only where its free end starts, so the space a slot gives up
+ * is not reused where it is. pack() takes all of it back at once by laying
+ * every slot out again. A texture cache such as WebRender's has to copy pixels
+ * to move an entry, so it repacks a little each frame. This atlas is cleared
+ * and drawn again every frame, so moving a slot only changes where the next
+ * frame draws it.
+ */
+class AtlasLayout {
+  width = ATLAS_MIN;
+  height = ATLAS_MIN;
+  private rows: Row[] = [];
+
+  /** Puts the slot at the free end of the first row that takes it, or on a new row below. */
+  fit(slot: Slot): boolean {
+    const spot = this.take(this.rows, slot);
+    if (!spot) return false;
+    this.settle(slot, spot);
+    return true;
+  }
+
+  /**
+   * Lays the slots out again on empty rows, tallest first, which is what shelf
+   * packing wants. The result is kept only if every slot fits, so a failed
+   * attempt leaves every slot where it was.
+   */
+  pack(slots: Slot[]): boolean {
+    const rows: Row[] = [];
+    const order = [...slots].sort((a, b) => b.height - a.height);
+    const spots: { x: number; y: number }[] = [];
+    for (const slot of order) {
+      const spot = this.take(rows, slot);
+      if (!spot) return false;
+      spots.push(spot);
+    }
+    this.rows = rows;
+    order.forEach((slot, i) => this.settle(slot, spots[i]));
+    return true;
+  }
+
+  /** Doubles the shorter side. Slots keep their places. */
+  grow(): boolean {
+    const { width, height } = this;
+    if (width >= ATLAS_MAX && height >= ATLAS_MAX) return false;
+    if (width <= height) this.width = Math.min(ATLAS_MAX, width * 2);
+    else this.height = Math.min(ATLAS_MAX, height * 2);
+    return true;
+  }
+
+  reset(): void {
+    this.rows = [];
+    this.width = ATLAS_MIN;
+    this.height = ATLAS_MIN;
+  }
+
+  private take(rows: Row[], slot: Slot): { x: number; y: number } | null {
+    for (const row of rows) {
+      if (row.height >= slot.height && row.cursor + slot.width <= this.width) {
+        const x = row.cursor;
+        row.cursor += slot.width;
+        return { x, y: row.y };
+      }
+    }
+
+    const bottom = rows.reduce((y, row) => Math.max(y, row.y + row.height), 0);
+    if (slot.width > this.width || bottom + slot.height > this.height) return null;
+    rows.push({ y: bottom, height: slot.height, cursor: slot.width });
+    return { x: 0, y: bottom };
+  }
+
+  private settle(slot: Slot, { x, y }: { x: number; y: number }): void {
+    slot.x = x;
+    slot.y = y;
+    slot.picture.size(slot.width, slot.height);
+    slot.picture.translate(x, y);
+  }
+}
+
 /**
  * Draws every animation on screen onto one canvas, then copies each into the
  * plain 2D canvas its embed owns.
@@ -769,10 +850,7 @@ abstract class Player {
 class AtlasPlayer extends Player {
   /** Drops the context-loss listeners on dispose, instead of a flag each checks. */
   private stopListening = new AbortController();
-  /** Rows of the atlas; each takes slots no taller than itself. */
-  private rows: { y: number; height: number; cursor: number }[] = [];
-  private spare: Patch[] = [];
-  private atlas = { width: ATLAS_MIN, height: ATLAS_MIN };
+  private layout = new AtlasLayout();
 
   private constructor(
     TVG: ThorVGNamespace,
@@ -846,12 +924,12 @@ class AtlasPlayer extends Player {
   protected place(slot: Slot): boolean {
     slot.target ??= slot.targetEl.getContext("2d");
     if (!slot.target) return false;
-    if (this.fit(slot)) return true;
-    while (this.grow()) if (this.fit(slot)) return true;
+    if (this.findRoom(slot)) return true;
+    while (this.grow()) if (this.findRoom(slot)) return true;
 
     // Full. Animations that are off screen go first: nothing is drawing them,
     // and coming back costs them only a reload.
-    while (this.evict()) if (this.fit(slot)) return true;
+    while (this.evict()) if (this.findRoom(slot)) return true;
 
     // Everything left is on screen. Halving takes a quarter of the room each
     // time — softer, but it moves. This is also the way in for an animation
@@ -859,20 +937,21 @@ class AtlasPlayer extends Player {
     while (Math.min(slot.width, slot.height) > 2) {
       slot.width = Math.round(slot.width / 2);
       slot.height = Math.round(slot.height / 2);
-      if (this.fit(slot)) return true;
+      if (this.findRoom(slot)) return true;
     }
 
     console.warn(`Lottie: no room on the atlas for ${slot.width}×${slot.height}`);
     return false;
   }
 
-  protected displace(slot: Slot): void {
-    this.spare.push({ x: slot.x, y: slot.y, width: slot.width, height: slot.height });
+  /**
+   * The slot's rectangle stays taken until the next pack(), the only place
+   * space comes back. With nothing left to draw, the atlas goes back to its
+   * smallest size.
+   */
+  protected displace(): void {
     if (this.slots.length) return;
-    // Nothing left to draw: the atlas goes back to nothing with it.
-    this.rows = [];
-    this.spare = [];
-    this.atlas = { width: ATLAS_MIN, height: ATLAS_MIN };
+    this.layout.reset();
     this.canvas.resize(ATLAS_MIN, ATLAS_MIN);
   }
 
@@ -896,54 +975,18 @@ class AtlasPlayer extends Player {
   }
 
   /**
-   * A released rectangle of the same size is handed back first — scrolling a
-   * note of one animation passes the same few rectangles round, so the atlas
-   * stops growing. Otherwise the slot joins a row tall enough to take it, or
-   * opens a new row below the last.
+   * Puts the slot after the others, or lays them all out again with it. The
+   * slot being resized is still among the others, so it is left out of them
+   * and packed once.
    */
-  private fit(slot: Slot): boolean {
-    const spare = this.spare.findIndex(
-      (patch) => patch.width === slot.width && patch.height === slot.height,
-    );
-    if (spare >= 0) {
-      const patch = this.spare.splice(spare, 1)[0];
-      return this.settle(slot, patch.x, patch.y);
-    }
-
-    for (const row of this.rows) {
-      if (row.height >= slot.height && row.cursor + slot.width <= this.atlas.width) {
-        const x = row.cursor;
-        row.cursor += slot.width;
-        return this.settle(slot, x, row.y);
-      }
-    }
-
-    const bottom = this.rows.reduce((y, row) => Math.max(y, row.y + row.height), 0);
-    if (slot.width > this.atlas.width || bottom + slot.height > this.atlas.height) return false;
-    this.rows.push({ y: bottom, height: slot.height, cursor: slot.width });
-    return this.settle(slot, 0, bottom);
+  private findRoom(slot: Slot): boolean {
+    if (this.layout.fit(slot)) return true;
+    return this.layout.pack([...this.slots.filter((other) => other !== slot), slot]);
   }
 
-  private settle(slot: Slot, x: number, y: number): boolean {
-    slot.x = x;
-    slot.y = y;
-    slot.picture.size(slot.width, slot.height);
-    slot.picture.translate(x, y);
-    return true;
-  }
-
-  /** Doubles the shorter side and lays everything out again. */
   private grow(): boolean {
-    const { width, height } = this.atlas;
-    if (width >= ATLAS_MAX && height >= ATLAS_MAX) return false;
-    if (width <= height) this.atlas.width = Math.min(ATLAS_MAX, width * 2);
-    else this.atlas.height = Math.min(ATLAS_MAX, height * 2);
-
-    this.canvas.resize(this.atlas.width, this.atlas.height);
-    this.rows = [];
-    this.spare = [];
-    // Tallest first, which is what shelf packing wants.
-    for (const slot of [...this.slots].sort((a, b) => b.height - a.height)) this.fit(slot);
+    if (!this.layout.grow()) return false;
+    this.canvas.resize(this.layout.width, this.layout.height);
     return true;
   }
 
