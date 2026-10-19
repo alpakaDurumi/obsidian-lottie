@@ -359,6 +359,14 @@ const ATLAS_MIN = 512;
 const ATLAS_MAX = 4096;
 
 /**
+ * How long the atlas waits, after a slot last gave space up, before it shrinks
+ * to what is left. It grows at once, so a size going back and forth across a
+ * step would otherwise reallocate it every time. Ten seconds is how long
+ * jemalloc takes by default to hand unused memory back (opt.dirty_decay_ms).
+ */
+const ATLAS_SHRINK_DELAY_MS = 10_000;
+
+/**
  * How long one frame may spend taking in animations that have just come into
  * view. Parsing a Lottie is the expensive part of that and a scroll can bring a
  * dozen at once; a quarter of a 60Hz frame leaves the rest for drawing.
@@ -758,8 +766,9 @@ interface Row {
 }
 
 /**
- * Where each slot sits on the atlas. It only answers whether a slot fits. What
- * to give up when nothing does is the player's decision.
+ * Where each slot sits on the atlas, and how large the atlas is. It only
+ * answers whether a slot fits. What to give up when nothing does is the
+ * player's decision.
  *
  * A row records only where its free end starts, so the space a slot gives up
  * is not reused where it is. pack() takes all of it back at once by laying
@@ -775,49 +784,73 @@ class AtlasLayout {
 
   /** Puts the slot at the free end of the first row that takes it, or on a new row below. */
   fit(slot: Slot): boolean {
-    const spot = this.take(this.rows, slot);
+    const spot = this.take(this.rows, slot, this.width, this.height);
     if (!spot) return false;
     this.settle(slot, spot);
     return true;
   }
 
+  /** Lays the slots out again at this size, or at the smallest larger one that holds them. */
+  pack(slots: Slot[]): boolean {
+    const now = { width: this.width, height: this.height };
+    return this.repack(slots, now, { width: ATLAS_MAX, height: ATLAS_MAX });
+  }
+
+  /** Lays the slots out again at the smallest size that holds them, no larger than this one. */
+  shrink(slots: Slot[]): void {
+    const now = { width: this.width, height: this.height };
+    this.repack(slots, { width: ATLAS_MIN, height: ATLAS_MIN }, now);
+  }
+
   /**
    * Lays the slots out again on empty rows, tallest first, which is what shelf
-   * packing wants. The result is kept only if every slot fits, so a failed
-   * attempt leaves every slot where it was.
+   * packing wants. Sizes are tried from `from` up to `to`, in the order the
+   * atlas grows, and the first that holds every slot is kept. If none does,
+   * nothing changes and every slot stays where it was.
    */
-  pack(slots: Slot[]): boolean {
-    const rows: Row[] = [];
+  private repack(slots: Slot[], from: Size, to: Size): boolean {
     const order = [...slots].sort((a, b) => b.height - a.height);
+    let { width, height } = from;
+    for (;;) {
+      const laid = this.layOut(order, width, height);
+      if (laid) {
+        this.width = width;
+        this.height = height;
+        this.rows = laid.rows;
+        order.forEach((slot, i) => this.settle(slot, laid.spots[i]));
+        return true;
+      }
+      if (width >= to.width && height >= to.height) return false;
+      // Doubling the shorter side keeps the atlas close to square.
+      if (width <= height) width = Math.min(ATLAS_MAX, width * 2);
+      else height = Math.min(ATLAS_MAX, height * 2);
+    }
+  }
+
+  /** Where each slot would go on an empty atlas of this size, or null if one does not fit. */
+  private layOut(
+    order: Slot[],
+    width: number,
+    height: number,
+  ): { rows: Row[]; spots: { x: number; y: number }[] } | null {
+    const rows: Row[] = [];
     const spots: { x: number; y: number }[] = [];
     for (const slot of order) {
-      const spot = this.take(rows, slot);
-      if (!spot) return false;
+      const spot = this.take(rows, slot, width, height);
+      if (!spot) return null;
       spots.push(spot);
     }
-    this.rows = rows;
-    order.forEach((slot, i) => this.settle(slot, spots[i]));
-    return true;
+    return { rows, spots };
   }
 
-  /** Doubles the shorter side. Slots keep their places. */
-  grow(): boolean {
-    const { width, height } = this;
-    if (width >= ATLAS_MAX && height >= ATLAS_MAX) return false;
-    if (width <= height) this.width = Math.min(ATLAS_MAX, width * 2);
-    else this.height = Math.min(ATLAS_MAX, height * 2);
-    return true;
-  }
-
-  reset(): void {
-    this.rows = [];
-    this.width = ATLAS_MIN;
-    this.height = ATLAS_MIN;
-  }
-
-  private take(rows: Row[], slot: Slot): { x: number; y: number } | null {
+  private take(
+    rows: Row[],
+    slot: Slot,
+    width: number,
+    height: number,
+  ): { x: number; y: number } | null {
     for (const row of rows) {
-      if (row.height >= slot.height && row.cursor + slot.width <= this.width) {
+      if (row.height >= slot.height && row.cursor + slot.width <= width) {
         const x = row.cursor;
         row.cursor += slot.width;
         return { x, y: row.y };
@@ -825,7 +858,7 @@ class AtlasLayout {
     }
 
     const bottom = rows.reduce((y, row) => Math.max(y, row.y + row.height), 0);
-    if (slot.width > this.width || bottom + slot.height > this.height) return null;
+    if (slot.width > width || bottom + slot.height > height) return null;
     rows.push({ y: bottom, height: slot.height, cursor: slot.width });
     return { x: 0, y: bottom };
   }
@@ -851,6 +884,7 @@ class AtlasPlayer extends Player {
   /** Drops the context-loss listeners on dispose, instead of a flag each checks. */
   private stopListening = new AbortController();
   private layout = new AtlasLayout();
+  private shrinkTimer: number | null = null;
 
   private constructor(
     TVG: ThorVGNamespace,
@@ -911,7 +945,14 @@ class AtlasPlayer extends Player {
     this.canvas.remove(slot.picture);
   }
 
+  /** A shrink still waiting would resize a canvas whose context is gone. */
+  halt(): void {
+    super.halt();
+    this.cancelShrink();
+  }
+
   protected dispose(): void {
+    this.cancelShrink();
     this.stopListening.abort();
     this.canvas.destroy();
     this.hostEl.parentElement?.remove();
@@ -925,10 +966,9 @@ class AtlasPlayer extends Player {
     slot.target ??= slot.targetEl.getContext("2d");
     if (!slot.target) return false;
     if (this.findRoom(slot)) return true;
-    while (this.grow()) if (this.findRoom(slot)) return true;
 
-    // Full. Animations that are off screen go first: nothing is drawing them,
-    // and coming back costs them only a reload.
+    // Full even at the largest size. Animations that are off screen go first:
+    // nothing is drawing them, and coming back costs them only a reload.
     while (this.evict()) if (this.findRoom(slot)) return true;
 
     // Everything left is on screen. Halving takes a quarter of the room each
@@ -945,14 +985,14 @@ class AtlasPlayer extends Player {
   }
 
   /**
-   * The slot's rectangle stays taken until the next pack(), the only place
-   * space comes back. With nothing left to draw, the atlas goes back to its
-   * smallest size.
+   * The slot's rectangle stays taken until the slots are next laid out again.
+   * The atlas shrinks to what is left only once no slot has given space up
+   * for ATLAS_SHRINK_DELAY_MS, so each one given up puts that off again.
    */
   protected displace(): void {
-    if (this.slots.length) return;
-    this.layout.reset();
-    this.canvas.resize(ATLAS_MIN, ATLAS_MIN);
+    this.cancelShrink();
+    if (this.broken) return;
+    this.shrinkTimer = window.setTimeout(this.shrink, ATLAS_SHRINK_DELAY_MS);
   }
 
   protected paint(scene: Slot[]): void {
@@ -975,19 +1015,36 @@ class AtlasPlayer extends Player {
   }
 
   /**
-   * Puts the slot after the others, or lays them all out again with it. The
-   * slot being resized is still among the others, so it is left out of them
-   * and packed once.
+   * Puts the slot after the others, or lays them all out again with it on an
+   * atlas sized to hold them. The slot being resized is still among the
+   * others, so it is left out of them and packed once.
    */
   private findRoom(slot: Slot): boolean {
     if (this.layout.fit(slot)) return true;
-    return this.layout.pack([...this.slots.filter((other) => other !== slot), slot]);
+    const before = { width: this.layout.width, height: this.layout.height };
+    if (!this.layout.pack([...this.slots.filter((other) => other !== slot), slot])) return false;
+    this.resizeCanvas(before);
+    return true;
   }
 
-  private grow(): boolean {
-    if (!this.layout.grow()) return false;
-    this.canvas.resize(this.layout.width, this.layout.height);
-    return true;
+  /** Lays what is left out again at the smallest size that holds it. */
+  private shrink = (): void => {
+    this.shrinkTimer = null;
+    const before = { width: this.layout.width, height: this.layout.height };
+    this.layout.shrink(this.slots);
+    this.resizeCanvas(before);
+  };
+
+  private cancelShrink(): void {
+    if (this.shrinkTimer === null) return;
+    window.clearTimeout(this.shrinkTimer);
+    this.shrinkTimer = null;
+  }
+
+  /** Reallocating the canvas costs, so it follows the layout only when the size changed. */
+  private resizeCanvas(before: Size): void {
+    const { width, height } = this.layout;
+    if (width !== before.width || height !== before.height) this.canvas.resize(width, height);
   }
 
   /** Drops whichever animation has been off screen longest. */
