@@ -179,6 +179,13 @@ function wasmBlobUrl(): string {
   return wasmUrl;
 }
 
+/** The blob stays in memory until its URL is revoked, even after the plugin is gone. */
+function revokeWasmUrl(): void {
+  if (!wasmUrl) return;
+  URL.revokeObjectURL(wasmUrl);
+  wasmUrl = null;
+}
+
 interface Size {
   width: number;
   height: number;
@@ -326,6 +333,26 @@ class LottieIndex extends Component {
 let nextCanvasId = 0;
 
 /**
+ * ThorVG finds a canvas by selector only while it is being made, and holds it
+ * by reference after, so the id is taken off again at once. Left on, it could
+ * be given out again by a plugin instance loaded later, whose count starts at
+ * 0 too, and ThorVG would find the old element first. An id that an older
+ * version left on an element is skipped.
+ */
+function withCanvasId<T>(el: HTMLCanvasElement, make: (selector: string) => T): T {
+  let id: string;
+  do {
+    id = `lottie-thorvg-${nextCanvasId++}`;
+  } while (window.document.getElementById(id));
+  el.id = id;
+  try {
+    return make(`#${id}`);
+  } finally {
+    el.removeAttribute("id");
+  }
+}
+
+/**
  * Binds ThorVG to a canvas that may belong to a popout window. It resolves its
  * selector against the main window's document, so the element is moved there
  * for the call and put straight back; from then on ThorVG holds it by
@@ -337,12 +364,11 @@ function bindCanvas(
   width: number,
   height: number,
 ): Canvas {
-  if (!el.id) el.id = `lottie-thorvg-${nextCanvasId++}`;
   const parent = el.parentElement;
   const next = el.nextSibling;
   window.document.body.appendChild(el);
   try {
-    return new TVG.Canvas(`#${el.id}`, { width, height });
+    return withCanvasId(el, (selector) => new TVG.Canvas(selector, { width, height }));
   } finally {
     if (parent) parent.insertBefore(el, next);
     else el.remove();
@@ -910,13 +936,17 @@ class AtlasPlayer extends Player {
       cls: "lottie-thorvg-host",
       attr: { "aria-hidden": "true" },
     });
-    const el = host.createEl("canvas", { attr: { id: `lottie-thorvg-${nextCanvasId++}` } });
+    const el = host.createEl("canvas");
     try {
-      const canvas = new TVG.Canvas(`#${el.id}`, {
-        width: ATLAS_MIN,
-        height: ATLAS_MIN,
-        enableDevicePixelRatio: false,
-      });
+      const canvas = withCanvasId(
+        el,
+        (selector) =>
+          new TVG.Canvas(selector, {
+            width: ATLAS_MIN,
+            height: ATLAS_MIN,
+            enableDevicePixelRatio: false,
+          }),
+      );
       const player = new AtlasPlayer(TVG, el, canvas);
       const { signal } = player.stopListening;
       el.addEventListener(
@@ -1240,6 +1270,8 @@ interface Playable {
   readonly file: TFile | null;
   /** Gives up the animation's slot, leaving it able to take another. */
   release(): void;
+  /** Gives everything up, the observer that would ask for another slot included. */
+  unmount(): void;
   /** Re-reads the source and shows it again. */
   redraw(): Promise<void>;
   /** Stops or plays the animation, as the autoplay setting is switched. */
@@ -1382,6 +1414,9 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
      */
     protected async mount(): Promise<void> {
       this.unmount();
+      // Obsidian may load an embed again that it kept after the plugin
+      // unloaded. Mounted, it would ask a plugin that is gone for a player.
+      if (this.plugin.unloaded) return;
       const mount = ++this.generation;
       this.mounted = true;
       this.paused = this.plugin.startPaused();
@@ -1438,7 +1473,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
     }
 
     /** Gives everything up. A later mount() draws again from nothing. */
-    protected unmount(): void {
+    unmount(): void {
       if (!this.mounted) return;
       this.mounted = false;
       this.generation++;
@@ -1724,7 +1759,7 @@ function withAnimation<T extends Constructor<Component>>(Base: T) {
 
         const player = await this.plugin.ensurePlayer();
         // The awaits above give the note time to close, or to scroll away.
-        if (this.generation !== mount || !this.onScreen) return;
+        if (!player || this.generation !== mount || !this.onScreen) return;
 
         // A Lottie that never said how large it is has had no canvas to lay out
         // with. It gets one at whatever size, and ThorVG's answer sizes it after.
@@ -2151,6 +2186,11 @@ export default class LottiePlugin extends Plugin {
   /** ThorVG fixes its backend at init(), so the two live and die together. */
   private engine: ThorVGNamespace | null = null;
   private player: Player | null = null;
+  /**
+   * Set by onunload(). An engine started after it would have nothing to stop
+   * it, so nothing may mount or ask for a player from then on.
+   */
+  unloaded = false;
 
   async onload(): Promise<void> {
     this.settings = Object.assign(
@@ -2227,16 +2267,23 @@ export default class LottiePlugin extends Plugin {
   // Obsidian calls onunload() without awaiting it, so the engine is left to
   // finish shutting down on its own.
   onunload(): void {
-    void this.transition(() => this.stopEngine());
+    this.unloaded = true;
+    // Obsidian keeps a note's embeds after the plugin that drew them is gone,
+    // and one scrolled back into view would ask this plugin for a player again.
+    for (const playable of [...this.playables]) playable.unmount();
+    void this.transition(async () => {
+      await this.stopEngine();
+      revokeWasmUrl();
+    });
   }
 
   /**
    * The software backend paints straight into the canvas each embed holds; the
    * GPU ones pool onto a single canvas, which is what keeps them under
-   * Chromium's ceiling on rendering contexts.
+   * Chromium's ceiling on rendering contexts. Null once the plugin has unloaded.
    */
-  ensurePlayer(): Promise<Player> {
-    return this.transition(() => this.startEngine());
+  ensurePlayer(): Promise<Player | null> {
+    return this.transition(async () => (this.unloaded ? null : this.startEngine()));
   }
 
   /** Whether an animation is to sit on its first frame until it is played. */
